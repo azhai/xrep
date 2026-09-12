@@ -8,7 +8,7 @@ package main
 //
 // 依赖：core:fmt、core:mem、core:time。
 // 说明：数据由 `i % 256` 生成（近似均匀分布），在偏移 1000 处埋入 "test"
-//       作为唯一真实命中；轮次间调用 arena_free_all 重置结果区，
+//       作为唯一真实命中；每轮结束释放命中数组（堆分配，见 ADR 0004），
 //       使测量聚焦于"扫描"而非"分配"。
 // ============================================================================
 
@@ -28,17 +28,15 @@ run_bench :: proc() {
     p: Progress
     progress_init(&p, u64(DATA_SIZE), false, false)
 
-    // 单个算法的测量：独立 arena、固定轮数、按 (数据量×轮数)/耗时 计算吞吐。
+    // 单个算法的测量：固定轮数，按 (数据量×轮数)/耗时 计算吞吐。
+    // 说明：命中数组由 matcher 在堆上分配（ADR 0004），因此每轮结束需要释放，
+    //       避免轮次间内存累积影响计时公平性（原先靠 arena_free_all 一次性回收）。
     bench_one :: proc(name: string, m: Match_Fn, data: []u8, ctx: Match_Ctx, p: ^Progress) {
-        arena: mem.Arena
-        arena_make(&arena, ARENA_BLOCK_SIZE)
-        defer arena_free(&arena)
         start := time.now()
         ROUNDS :: 10
         for _ in 0..<ROUNDS {
-            _ = m(data, ctx, &arena, p)
-            // 重置结果区，避免轮次间内存增长影响计时公平性。
-            mem.arena_free_all(&arena)
+            res := m(data, ctx, p)
+            delete(res)
         }
         dur := time.since(start)
         sec := f64(dur) / f64(time.Second)

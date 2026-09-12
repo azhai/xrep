@@ -4,12 +4,11 @@ package main
 // common_test.odin — 基础层单元测试
 //
 // 覆盖：lower_table 填充规则（含非字母字节透传）、s2b 零拷贝视图语义、
-//       arena_make/arena_free 生命周期。
+//       运行期常量不变量。
 // 注意：`lower_table` 由 common.odin 的 `@(init)` 过程在进程启动时填充，
 //       main 与 `odin test` 走同一条启动路径，因此用例**无需**手动初始化。
 // ============================================================================
 
-import "core:mem"
 import "core:testing"
 
 @(test)
@@ -59,22 +58,6 @@ test_s2b_is_zero_copy_view :: proc(t: ^testing.T) {
     testing.expect_value(t, len(b), len(s))
 }
 
-@(test)
-test_arena_make_and_free :: proc(t: ^testing.T) {
-    arena: mem.Arena
-    arena_make(&arena, 1024)
-    testing.expect(t, arena.data != nil, "arena.data 已分配")
-    testing.expect_value(t, len(arena.data), 1024)
-
-    // 分配器可用：从 arena 分配后 reset 可复用容量
-    alloc := mem.arena_allocator(&arena)
-    buf := make([]u8, 64, alloc)
-    testing.expect_value(t, len(buf), 64)
-    mem.arena_free_all(&arena)
-
-    arena_free(&arena)
-}
-
 // ---------------------------------------------------------------------------
 // clamp_thread_count（--threads 范围校验的纯函数部分）
 // ---------------------------------------------------------------------------
@@ -100,7 +83,6 @@ test_runtime_constants_sane :: proc(t: ^testing.T) {
     // 常量抽取后仍需满足基本不变量，避免误调
     testing.expect(t, TASK_CHUNK_SIZE > 0, "分片大小必须为正")
     testing.expect(t, CHUNK_OVERLAP > 0, "重叠窗口必须为正")
-    testing.expect(t, ARENA_BLOCK_SIZE > 0, "arena 容量必须为正")
     testing.expect(t, PROGRESS_MIN_INTERVAL > 0, "进度刷新间隔必须为正")
     testing.expect(t, MAX_THREADS_FACTOR >= 1, "线程数上限倍数至少为 1")
     testing.expect(t, FALLBACK_MAX_THREADS >= DEFAULT_THREAD_COUNT, "兜底上界不应小于默认线程数")

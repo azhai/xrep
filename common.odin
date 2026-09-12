@@ -59,15 +59,34 @@ s2b :: proc(s: string) -> []u8 {
 // 跨模块共享的类型
 // ---------------------------------------------------------------------------
 
-// 匹配上下文：模式字节与其大小写敏感开关。
+// 匹配上下文：模式字节、大小写敏感开关，以及**额外模式**（-e / -f 的多模式）。
+// 单模式时 extra 为空 → 走 alg_table 选定的原算法，性能与行为完全不变；
+// 多模式时 extra 非空 → 由 multi_match 逐位置比较整张模式表。
 Match_Ctx :: struct {
     pattern:          []u8,
     case_insensitive: bool,
+    extra:            [][]u8,
 }
 
-// 匹配结果：目前只记录命中位置（文件内的字节偏移）。
+// 模式总数（主模式 + 额外模式）。主模式始终占 1 个槽位。
+ctx_pattern_count :: proc(ctx: Match_Ctx) -> int {
+    return 1 + len(ctx.extra)
+}
+
+// 按索引取模式：0 号是主模式，其余依次为 extra。
+ctx_pattern_at :: proc(ctx: Match_Ctx, i: int) -> []u8 {
+    if i == 0 {
+        return ctx.pattern
+    }
+    return ctx.extra[i - 1]
+}
+
+// 匹配结果：命中位置（文件内的字节偏移）与命中长度。
+// pat_len 由匹配算法写入，用于 --context / -o 的高亮区间；
+// 为 0 表示"未标注"，调用方回退到主模式长度（历史行为，保持兼容）。
 Match_Result :: struct {
-    offset: u64,
+    offset:  u64,
+    pat_len: u32,
 }
 
 // 匹配函数签名（能力缝隙 / capability seam）。
@@ -75,9 +94,15 @@ Match_Result :: struct {
 // 调用方（worker）无需知道具体算法。
 //   data     — 待扫描数据（可能只是文件的一个分片）
 //   ctx      — 模式与匹配选项
-//   arena    — 结果分配器，命中数组从 arena 分配，生命周期由调用方管理
 //   progress — 进度上报；可为 disabled 状态（进度条关闭时）
-Match_Fn :: proc(data: []u8, ctx: Match_Ctx, arena: ^mem.Arena, progress: ^Progress) -> []Match_Result
+//
+// 返回值所有权：返回的切片归**调用方**所有，必须由调用方 `delete`。
+//
+// 为什么结果不再来自 arena（ADR 0004）：命中数是输入的函数、没有上界，而
+// arena 是定长的 —— 超过块容量时 `append` 会**静默失败**（不报错、不回滚），
+// 表现为"命中被悄悄丢弃"。实测 `a` 扫 2.5 MiB 全 `a` 文件时，16 MiB 的 arena
+// 只装得下 1572864 条（真值 2621440），丢了 40%。改为堆分配后无容量上限。
+Match_Fn :: proc(data: []u8, ctx: Match_Ctx, progress: ^Progress) -> []Match_Result
 
 // 算法条目：以模式长度区间选择匹配算法。
 Algorithm_Entry :: struct {
@@ -101,9 +126,6 @@ TASK_CHUNK_SIZE :: 2 * mem.Megabyte
 // （见 README「已知行为与限制」#2）。
 CHUNK_OVERLAP :: 16
 
-// 每个 arena 的初始容量；归还时仅 reset 不释放，故不可随意调大。
-ARENA_BLOCK_SIZE :: 16 * mem.Megabyte
-
 // 进度条自动刷新的最小间隔（限流），避免高频刷新拖慢多线程热路径。
 PROGRESS_MIN_INTERVAL :: 200 * time.Millisecond
 
@@ -114,7 +136,29 @@ MAX_THREADS_FACTOR :: 4
 FALLBACK_MAX_THREADS :: 64
 
 // 版本号：由 --version 输出。对外行为变更时递增。
-XREP_VERSION :: "0.2.0"
+XREP_VERSION :: "0.3.0"
+
+// ---------------------------------------------------------------------------
+// 输出与统计
+// ---------------------------------------------------------------------------
+
+// --color=WHEN 的三态。Auto 在实际输出前解析为布尔值（看 stdout 是否 TTY），
+// 因此本类型是纯数据，不依赖 core:os —— 解析函数放在 io_utils.resolve_color。
+Color_Mode :: enum {
+    Auto,
+    Always,
+    Never,
+}
+
+// 整个进程的汇总统计（--stats）。跨文件累加，最后统一写 stderr。
+// 注意：--quiet 只抑制 stdout，不影响本统计（统计走 stderr，与"错误可见"同理）。
+Run_Stats :: struct {
+    files_scanned: uint, // 真正读过并扫描的文件数
+    files_matched: uint, // 至少有一条命中的文件数
+    files_skipped: uint, // --max-size 跳过的文件数
+    bytes_scanned: u64, // 累计扫描字节数
+    total_hits:    u64, // 累计命中数
+}
 
 // 把用户给出的线程数夹到 [1, max_threads]。
 // 纯函数（不探测硬件），便于单测：max_threads 由调用方提供。
@@ -132,19 +176,4 @@ clamp_thread_count :: proc(n: uint, max_threads: uint) -> uint {
         return cap
     }
     return n
-}
-
-// ---------------------------------------------------------------------------
-// Arena 辅助
-// ---------------------------------------------------------------------------
-
-// 在堆上申请 size 字节并初始化为 arena。
-// 注意：arena.data 由 make 分配，释放必须走 arena_free（而不是 mem.arena_free_all）。
-arena_make :: proc(arena: ^mem.Arena, size: uint) {
-    mem.arena_init(arena, make([]byte, size))
-}
-
-// 释放 arena 自身持有的内存块。
-arena_free :: proc(arena: ^mem.Arena) {
-    delete(arena.data)
 }

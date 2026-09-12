@@ -75,6 +75,12 @@ results := make([dynamic]Match_Result, 0, 64, mem.arena_allocator(arena))
 设计意图（结果数组从 arena 批量分配）保持不变，副作用消失。已在
 matcher.odin 文件头写明"不得改 `context.allocator`"及其原因。
 
+> **后续（ADR 0004，2026-09-12）**：本节"用 arena 承载命中数组"的**设计意图**
+> 本身已被推翻 —— arena 定长，而命中数无上界，超容量时 `append` 会静默丢命中
+> （实测 `all_a.bin` 丢失 40%）。现在命中数组改用 `context.allocator`（进程默认堆）
+> 分配，`Arena_Pool` 已删除。本节"不得改 `context.allocator`"这条**约束仍然有效**
+> （改写线程分配器始终是错的），只是结果数组不再需要 arena 参数。
+
 ### 3. `merge_ordered_matches` 的临时缓冲用后即释放
 
 `ptrs` / `non_empty` 是每次归并都会分配的临时数组（长度 = 线程数），原先从不释放，

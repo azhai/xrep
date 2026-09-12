@@ -10,12 +10,16 @@ package main
 //   * print_context     — 把窗口内的字节以 hex 打印，命中字节红色高亮。
 //   * sanitize_dump_name— 纯函数：把路径分隔符等清洗为下划线（dump-prefix 用）。
 //   * dump_matches      — 把命中偏移按指定进制写入文件（支持覆盖/追加）。
+//   * build_line_index / line_of — 换行位置表与"偏移 → 行号"二分查找（-n / 行导向）。
+//   * json_escape       — 把字符串转义为可嵌入 JSON 的形态（--json）。
+//   * resolve_color     — 纯函数：把 --color=WHEN 解析为布尔值。
 //
-// 依赖：core:fmt、core:os。
+// 依赖：core:fmt、core:os、core:strings。
 // ============================================================================
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 
 // 整文件读取。成功返回数据切片（调用方负责 delete），失败返回 os.Error。
 read_file_data :: proc(path: string) -> (data: []byte, err: os.Error) {
@@ -148,4 +152,133 @@ dump_matches :: proc(path: string, matches: []Match_Result, offset_hex: bool, ap
         }
     }
     return true
+}
+
+// 把 data[offset, offset+pat_len) 打成连续的两位十六进制（无分隔符，形如 `74657374`）。
+// 用途：`-o/--only-matching` 与 JSON 的 `match` 字段 —— 二进制安全且可直接嵌字符串。
+// 越界自动夹取，调用方无需先做边界检查。
+print_hex_bytes :: proc(data: []u8, offset: u64, pat_len: uint) {
+    start := uint(offset)
+    if start >= uint(len(data)) {
+        return
+    }
+    end := start + pat_len
+    if end > uint(len(data)) {
+        end = uint(len(data))
+    }
+    for i in start..<end {
+        fmt.printf("%02x", data[i])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 行号索引（-n / 行导向输出）
+// ---------------------------------------------------------------------------
+
+// 构建"换行位置表"：返回的 idx 中，idx[i] 是第 i 个 '\n' 的字节偏移（升序）。
+// 偏移 o 所在行号 = "严格小于 o 的换行数" + 1（1-based）。
+//
+// 为什么先建表：流式输出线程可能按分片完成的乱序拿到命中，若每条命中都从头
+// 数换行，单文件代价是 O(命中数 × 文件长度)。建表一次是 O(文件长度)，
+// 之后每条命中 O(log 换行数)。
+//
+// 内存代价：换行数 × 8B（100MB 文本约 250 万行 → 20MB）。因此**只在真正需要
+// 行号时才构建**（见 scan.odin 的 line_index_needed）。
+// 返回切片由调用方 delete。
+build_line_index :: proc(data: []u8) -> []u64 {
+    count := 0
+    for b in data {
+        if b == '\n' {
+            count += 1
+        }
+    }
+    idx := make([]u64, count)
+    k := 0
+    for b, i in data {
+        if b == '\n' {
+            idx[k] = u64(i)
+            k += 1
+        }
+    }
+    return idx
+}
+
+// 行号（1-based）：二分查找第一个 >= offset 的换行位置，其下标即"前面的换行数"。
+line_of :: proc(index: []u64, offset: u64) -> u64 {
+    lo := 0
+    hi := len(index)
+    for lo < hi {
+        mid := (lo + hi) / 2
+        if index[mid] < offset {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return u64(lo) + 1
+}
+
+// ---------------------------------------------------------------------------
+// JSON 输出（--json / --jsonl）
+// ---------------------------------------------------------------------------
+
+// 0..15 → 小写十六进制字符。
+// 用算术而非查表字符串：Odin 不允许用一个变量下标去索引常量字符串。
+hex_digit :: proc(v: u8) -> u8 {
+    if v < 10 {
+        return '0' + v
+    }
+    return 'a' + (v - 10)
+}
+
+// 把字符串转义为可安全嵌入 JSON 双引号之间的内容。
+// 按**字节**遍历而非按 rune：路径可能含非 UTF-8 字节，原样透传才能保证
+// 输出始终是可解析的 JSON（JSON 允许任意 UTF-8，非法字节按字节输出）。
+// 返回新分配字符串，调用方负责 delete。
+json_escape :: proc(s: string) -> string {
+    b: strings.Builder
+    strings.builder_init(&b)
+    for i in 0..<len(s) {
+        c := s[i]
+        switch c {
+        case '"':
+            strings.write_string(&b, "\\\"")
+        case '\\':
+            strings.write_string(&b, "\\\\")
+        case '\n':
+            strings.write_string(&b, "\\n")
+        case '\r':
+            strings.write_string(&b, "\\r")
+        case '\t':
+            strings.write_string(&b, "\\t")
+        case:
+            if c < 0x20 {
+                // 其余控制字符统一走 \u00XX。
+                strings.write_string(&b, "\\u00")
+                strings.write_byte(&b, hex_digit((c >> 4) & 0xF))
+                strings.write_byte(&b, hex_digit(c & 0xF))
+            } else {
+                strings.write_byte(&b, c)
+            }
+        }
+    }
+    return strings.to_string(b)
+}
+
+// ---------------------------------------------------------------------------
+// 颜色
+// ---------------------------------------------------------------------------
+
+// 把 --color=WHEN 解析为布尔值：Auto 以 stdout 是否为终端为准。
+// 纯函数（除 Auto 分支的一次 os.is_tty 查询），便于单测 Always/Never。
+resolve_color :: proc(mode: Color_Mode) -> bool {
+    switch mode {
+    case .Always:
+        return true
+    case .Never:
+        return false
+    case .Auto:
+        return os.is_tty(os.stdout)
+    }
+    return false
 }

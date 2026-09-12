@@ -9,13 +9,14 @@ package main
 //   * bndm_match 与 naive_match 的委托一致性
 //   * 三种算法在同一输入上的结果一致性
 //
-// 内存约定：匹配算法**不再**改写 context.allocator，改为把 arena 分配器显式
-//           传给 make（见 matcher.odin 文件头）。因此用例无需再保存/恢复分配器。
+// 内存约定：命中数组由默认分配器（堆）承载，不再由 arena 承载 —— arena 定长，
+//           超容量时 append 会静默丢命中（见 matcher.odin 文件头 / ADR 0004）。
+//           返回值归调用方所有，故每个用例都用 defer delete 释放。
 // 初始化： alg_table 是编译期常量；lower_table 由 `@(init)` 在启动时填充。
 //           两者都不需要用例手动初始化（main 与 `odin test` 启动路径一致）。
 // ============================================================================
 
-import "core:mem"
+
 import "core:testing"
 
 // 构造一个关闭渲染的进度条，避免测试输出被进度条干扰。
@@ -46,15 +47,13 @@ test_select_matcher_boundaries :: proc(t: ^testing.T) {
 
 @(test)
 test_single_match :: proc(t: ^testing.T) {
-    arena: mem.Arena
-    arena_make(&arena, mem.Megabyte)
-    defer arena_free(&arena)
     p := test_progress()
 
     // 常规：单字节模式在数据中多次出现
     {
         ctx := Match_Ctx{pattern = s2b("a"), case_insensitive = false}
-        got := single_match(s2b("banana"), ctx, &arena, &p)
+        got := single_match(s2b("banana"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 3)
         testing.expect_value(t, got[0].offset, u64(1))
         testing.expect_value(t, got[1].offset, u64(3))
@@ -63,55 +62,59 @@ test_single_match :: proc(t: ^testing.T) {
     // 边界：无命中
     {
         ctx := Match_Ctx{pattern = s2b("z"), case_insensitive = false}
-        got := single_match(s2b("banana"), ctx, &arena, &p)
+        got := single_match(s2b("banana"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 边界：空数据
     {
         ctx := Match_Ctx{pattern = s2b("a"), case_insensitive = false}
-        got := single_match(s2b(""), ctx, &arena, &p)
+        got := single_match(s2b(""), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 大小写不敏感：大写模式也能命中
     {
         ctx := Match_Ctx{pattern = s2b("B"), case_insensitive = true}
-        got := single_match(s2b("banana"), ctx, &arena, &p)
+        got := single_match(s2b("banana"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(0))
     }
     // 大小写敏感：大写模式不应命中
     {
         ctx := Match_Ctx{pattern = s2b("B"), case_insensitive = false}
-        got := single_match(s2b("banana"), ctx, &arena, &p)
+        got := single_match(s2b("banana"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 非 ASCII 字节必须按原始字节匹配（不被 lower 表改写）
     {
         data := []u8{0xC3, 0x80, 0xC3, 0x80} // UTF-8 "ÀÀ"
         ctx := Match_Ctx{pattern = []u8{0xC3}, case_insensitive = true}
-        got := single_match(data, ctx, &arena, &p)
+        got := single_match(data, ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 2)
     }
 }
 
 @(test)
 test_naive_match :: proc(t: ^testing.T) {
-    arena: mem.Arena
-    arena_make(&arena, mem.Megabyte)
-    defer arena_free(&arena)
     p := test_progress()
 
     // 常规：单次命中
     {
         ctx := Match_Ctx{pattern = s2b("ab"), case_insensitive = false}
-        got := naive_match(s2b("xxabxx"), ctx, &arena, &p)
+        got := naive_match(s2b("xxabxx"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(2))
     }
     // 重叠命中：模式 "aa" 在 "aaaa" 中产生 3 个位置（0/1/2）
     {
         ctx := Match_Ctx{pattern = s2b("aa"), case_insensitive = false}
-        got := naive_match(s2b("aaaa"), ctx, &arena, &p)
+        got := naive_match(s2b("aaaa"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 3)
         testing.expect_value(t, got[0].offset, u64(0))
         testing.expect_value(t, got[1].offset, u64(1))
@@ -120,45 +123,52 @@ test_naive_match :: proc(t: ^testing.T) {
     // 边界：空模式 → 空结果（不得死循环或越界）
     {
         ctx := Match_Ctx{pattern = s2b(""), case_insensitive = false}
-        got := naive_match(s2b("abc"), ctx, &arena, &p)
+        got := naive_match(s2b("abc"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 边界：模式比数据长 → 空结果
     {
         ctx := Match_Ctx{pattern = s2b("abcdef"), case_insensitive = false}
-        got := naive_match(s2b("abc"), ctx, &arena, &p)
+        got := naive_match(s2b("abc"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 边界：模式与数据等长 → 命中一次（偏移 0）
     {
         ctx := Match_Ctx{pattern = s2b("abc"), case_insensitive = false}
-        got := naive_match(s2b("abc"), ctx, &arena, &p)
+        got := naive_match(s2b("abc"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(0))
     }
     // 边界：空数据
     {
         ctx := Match_Ctx{pattern = s2b("a"), case_insensitive = false}
-        got := naive_match(s2b(""), ctx, &arena, &p)
+        got := naive_match(s2b(""), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 大小写不敏感：混合大小写互相命中
     {
         ctx := Match_Ctx{pattern = s2b("AbC"), case_insensitive = true}
-        got := naive_match(s2b("xxaBcxx"), ctx, &arena, &p)
+        got := naive_match(s2b("xxaBcxx"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(2))
     }
     // 大小写敏感：混合大小写不应命中
     {
         ctx := Match_Ctx{pattern = s2b("AbC"), case_insensitive = false}
-        got := naive_match(s2b("xxaBcxx"), ctx, &arena, &p)
+        got := naive_match(s2b("xxaBcxx"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 0)
     }
     // 边界：命中出现在数据末尾
     {
         ctx := Match_Ctx{pattern = s2b("test"), case_insensitive = false}
-        got := naive_match(s2b("aaaa test"), ctx, &arena, &p)
+        got := naive_match(s2b("aaaa test"), ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(5))
     }
@@ -166,7 +176,8 @@ test_naive_match :: proc(t: ^testing.T) {
     {
         data := []u8{0x00, 0x01, 0x41, 0x00, 0x41}
         ctx := Match_Ctx{pattern = []u8{0x00, 0x41}, case_insensitive = false}
-        got := naive_match(data, ctx, &arena, &p)
+        got := naive_match(data, ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         // 仅偏移 3 处对齐（偏移 0 处第二字节为 0x01，不匹配）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(3))
@@ -175,7 +186,8 @@ test_naive_match :: proc(t: ^testing.T) {
     {
         data := []u8{0x00, 0x41, 0x00}
         ctx := Match_Ctx{pattern = []u8{0x00, 0x41}, case_insensitive = false}
-        got := naive_match(data, ctx, &arena, &p)
+        got := naive_match(data, ctx, &p)
+        defer delete(got)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(got), 1)
         testing.expect_value(t, got[0].offset, u64(0))
     }
@@ -183,17 +195,16 @@ test_naive_match :: proc(t: ^testing.T) {
 
 @(test)
 test_bndm_matches_naive :: proc(t: ^testing.T) {
-    arena: mem.Arena
-    arena_make(&arena, mem.Megabyte)
-    defer arena_free(&arena)
     p := test_progress()
 
     // bndm_match 当前委托 naive_match，两者结果必须逐项一致（含偏移顺序）。
     data := s2b("abcabcabXabc")
     ctx := Match_Ctx{pattern = s2b("abc"), case_insensitive = false}
-    a := bndm_match(data, ctx, &arena, &p)
+    a := bndm_match(data, ctx, &p)
+    defer delete(a)  // 返回值归调用方所有（堆分配，见 matcher.odin）
     testing.expect_value(t, len(a), 3)
-    b := naive_match(data, ctx, &arena, &p)
+    b := naive_match(data, ctx, &p)
+    defer delete(b)  // 返回值归调用方所有（堆分配，见 matcher.odin）
     testing.expect_value(t, len(b), 3)
     for i in 0..<len(a) {
         testing.expect_value(t, a[i].offset, b[i].offset)
@@ -202,9 +213,6 @@ test_bndm_matches_naive :: proc(t: ^testing.T) {
 
 @(test)
 test_matchers_agree_across_algorithms :: proc(t: ^testing.T) {
-    arena: mem.Arena
-    arena_make(&arena, mem.Megabyte)
-    defer arena_free(&arena)
     p := test_progress()
 
     // 合成一段可预测的数据：周期 7 的字节序列，并埋入若干模式实例。
@@ -219,8 +227,10 @@ test_matchers_agree_across_algorithms :: proc(t: ^testing.T) {
     {
         pat := s2b("d")
         ctx := Match_Ctx{pattern = pat, case_insensitive = false}
-        s1 := single_match(data, ctx, &arena, &p)
-        n1 := naive_match(data, ctx, &arena, &p)
+        s1 := single_match(data, ctx, &p)
+        defer delete(s1)  // 返回值归调用方所有（堆分配，见 matcher.odin）
+        n1 := naive_match(data, ctx, &p)
+        defer delete(n1)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(s1), len(n1))
         for i in 0..<len(s1) {
             testing.expect_value(t, s1[i].offset, n1[i].offset)
@@ -229,8 +239,10 @@ test_matchers_agree_across_algorithms :: proc(t: ^testing.T) {
     // 4 字节模式：bndm（委托 naive）与 naive 必须一致，且命中数符合埋点
     {
         ctx := Match_Ctx{pattern = s2b("aaaa"), case_insensitive = false}
-        b1 := bndm_match(data, ctx, &arena, &p)
-        n1 := naive_match(data, ctx, &arena, &p)
+        b1 := bndm_match(data, ctx, &p)
+        defer delete(b1)  // 返回值归调用方所有（堆分配，见 matcher.odin）
+        n1 := naive_match(data, ctx, &p)
+        defer delete(n1)  // 返回值归调用方所有（堆分配，见 matcher.odin）
         testing.expect_value(t, len(b1), len(n1))
         // 偏移 100 与 300 处各埋入 "aaaa"，其中偏移 100 处的 a 也存在于周期序列中，
         // 因此只断言"至少包含这两处"，避免依赖周期数据的巧合匹配。
@@ -242,4 +254,99 @@ test_matchers_agree_across_algorithms :: proc(t: ^testing.T) {
         testing.expect(t, found_100 && found_300, "应命中埋入的 100/300 两处")
     }
     delete(data)
+}
+
+// ---------------------------------------------------------------------------
+// 多模式（-e / -f）：select_matcher_for 与 multi_match
+// ---------------------------------------------------------------------------
+
+@(test)
+test_select_matcher_for_dispatch :: proc(t: ^testing.T) {
+    // 单模式：走长度分派，结果必须与 select_matcher 完全一致（零回退）
+    single := Match_Ctx{pattern = s2b("ab")}
+    testing.expect(t, select_matcher_for(single) == select_matcher(2), "单模式应走长度分派")
+    single1 := Match_Ctx{pattern = s2b("a")}
+    testing.expect(t, select_matcher_for(single1) == single_match, "1 字节应选 single_match")
+
+    // 多模式：统一走 multi_match
+    multi := Match_Ctx{pattern = s2b("ab"), extra = [][]u8{s2b("cd")}}
+    testing.expect(t, select_matcher_for(multi) == multi_match, "多模式应走 multi_match")
+}
+
+@(test)
+test_multi_match_correctness :: proc(t: ^testing.T) {
+    p := test_progress()
+
+    // "foo test bar testfoo" 中：foo@0、test@4、test@13、foo@17
+    data := s2b("foo test bar testfoo")
+    ctx := Match_Ctx{pattern = s2b("test"), extra = [][]u8{s2b("foo")}}
+    got := multi_match(data, ctx, &p)
+    defer delete(got)
+    testing.expect_value(t, len(got), 4)
+    testing.expect_value(t, got[0].offset, u64(0))
+    testing.expect_value(t, got[0].pat_len, u32(3)) // 命中 foo
+    testing.expect_value(t, got[1].offset, u64(4))
+    testing.expect_value(t, got[1].pat_len, u32(4)) // 命中 test
+    testing.expect_value(t, got[2].offset, u64(13))
+    testing.expect_value(t, got[2].pat_len, u32(4))
+    testing.expect_value(t, got[3].offset, u64(17))
+    testing.expect_value(t, got[3].pat_len, u32(3))
+}
+
+@(test)
+test_multi_match_case_insensitive :: proc(t: ^testing.T) {
+    p := test_progress()
+
+    data := s2b("FOO Test")
+    ctx := Match_Ctx{pattern = s2b("test"), case_insensitive = true, extra = [][]u8{s2b("foo")}}
+    got := multi_match(data, ctx, &p)
+    defer delete(got)
+    testing.expect_value(t, len(got), 2)
+    testing.expect_value(t, got[0].offset, u64(0))
+    testing.expect_value(t, got[1].offset, u64(4))
+}
+
+@(test)
+test_multi_match_empty_pattern_skipped :: proc(t: ^testing.T) {
+    p := test_progress()
+
+    // 空模式不产生命中（与 naive_match 对空模式的约定一致）
+    data := s2b("abc")
+    ctx := Match_Ctx{pattern = s2b(""), extra = [][]u8{s2b("b")}}
+    got := multi_match(data, ctx, &p)
+    defer delete(got)
+    testing.expect_value(t, len(got), 1)
+    testing.expect_value(t, got[0].offset, u64(1))
+    testing.expect_value(t, got[0].pat_len, u32(1))
+}
+
+// ---------------------------------------------------------------------------
+// 回归：命中数组不得因分配器容量上限而静默丢命中（ADR 0004）
+// ---------------------------------------------------------------------------
+
+// 历史缺陷：命中数组曾从定长 arena 分配。适配器内部按 2 倍扩容，
+// 而扩容需要"旧缓冲 + 新缓冲"同时在世，因此峰值占用 ≈ 最终容量的 2 倍。
+// 当峰值超过 arena 块（当时 16 MiB）时，Odin 的 append **静默失败**：
+// 不报错、不 panic，只是后续命中全部丢失。
+// 该用例的规模（60 万条单字节命中，结果区约 9.6 MiB，扩容峰值约 19.2 MiB）
+// 恰好越过旧的 16 MiB 上限 —— 因此它能真正区分修复前后。
+@(test)
+test_dense_results_not_truncated :: proc(t: ^testing.T) {
+    p := test_progress()
+
+    N :: 600_000
+    data := make([]u8, N)
+    defer delete(data)
+    for i in 0..<len(data) {
+        data[i] = 'a'
+    }
+
+    ctx := Match_Ctx{pattern = s2b("a"), case_insensitive = false}
+    got := single_match(data, ctx, &p)
+    defer delete(got)
+
+    testing.expect_value(t, len(got), N)
+    // 首尾命中偏移必须正确（防止"数量对但内容错"的伪修复）
+    testing.expect_value(t, got[0].offset, u64(0))
+    testing.expect_value(t, got[N - 1].offset, u64(N - 1))
 }

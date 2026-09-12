@@ -65,7 +65,7 @@ run_tests :: proc() -> bool {
         }
     }
     {
-        s := []Match_Result{{5}, {1}, {3}}
+        s := []Match_Result{{offset = 5}, {offset = 1}, {offset = 3}}
         less :: proc(a, b: Match_Result) -> bool { return a.offset < b.offset }
         slice_sort(Match_Result, s, less)
         if s[0].offset != 1 || s[1].offset != 3 || s[2].offset != 5 {
@@ -77,14 +77,12 @@ run_tests :: proc() -> bool {
     }
     {
         // 朴素匹配冒烟：在 "xxabxx" 中命中 "ab"（偏移 2），且进度条关闭。
-        arena: mem.Arena
-        arena_make(&arena, mem.Megabyte)
-        defer arena_free(&arena)
         ctx := Match_Ctx{pattern = s2b("ab"), case_insensitive = false}
         data := s2b("xxabxx")
         p: Progress
         progress_init(&p, 0, false, false)
-        matches := naive_match(data, ctx, &arena, &p)
+        matches := naive_match(data, ctx, &p)
+        defer delete(matches) // 返回值归调用方所有（堆分配，见 matcher.odin）
         if len(matches) != 1 || matches[0].offset != 2 {
             fmt.println("FAIL naive_match")
             ok = false

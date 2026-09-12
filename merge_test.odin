@@ -30,7 +30,7 @@ test_merge_ordered_matches_empty :: proc(t: ^testing.T) {
 
 @(test)
 test_merge_ordered_matches_single_list :: proc(t: ^testing.T) {
-    one := []Match_Result{{1}, {5}, {9}}
+    one := []Match_Result{{offset = 1}, {offset = 5}, {offset = 9}}
     r := merge_ordered_matches([][]Match_Result{ one })
     testing.expect_value(t, len(r), 3)
     testing.expect_value(t, r[0].offset, u64(1))
@@ -42,9 +42,9 @@ test_merge_ordered_matches_single_list :: proc(t: ^testing.T) {
 @(test)
 test_merge_ordered_matches_interleaved :: proc(t: ^testing.T) {
     // 三路交错：验证全局升序（各输入自身已升序）
-    a := []Match_Result{{0}, {7}, {100}}
-    b := []Match_Result{{1}, {8}}
-    c := []Match_Result{{3}, {9}, {101}, {102}}
+    a := []Match_Result{{offset = 0}, {offset = 7}, {offset = 100}}
+    b := []Match_Result{{offset = 1}, {offset = 8}}
+    c := []Match_Result{{offset = 3}, {offset = 9}, {offset = 101}, {offset = 102}}
     r := merge_ordered_matches([][]Match_Result{ a, b, c })
     testing.expect_value(t, len(r), 9)
     want := []u64{0, 1, 3, 7, 8, 9, 100, 101, 102}
@@ -59,9 +59,9 @@ test_merge_ordered_matches_interleaved :: proc(t: ^testing.T) {
 @(test)
 test_merge_ordered_matches_empty_entries_and_duplicates :: proc(t: ^testing.T) {
     // 混合空列表与非空列表
-    a := []Match_Result{{2}}
+    a := []Match_Result{{offset = 2}}
     empty: []Match_Result
-    b := []Match_Result{{4}}
+    b := []Match_Result{{offset = 4}}
     r := merge_ordered_matches([][]Match_Result{ a, empty, b })
     testing.expect_value(t, len(r), 2)
     testing.expect_value(t, r[0].offset, u64(2))
@@ -69,8 +69,8 @@ test_merge_ordered_matches_empty_entries_and_duplicates :: proc(t: ^testing.T) {
     delete(r)
 
     // 重复偏移必须全部保留（分片重叠会产生重复命中，由调用方决定是否处理）
-    d1 := []Match_Result{{5}, {5}}
-    d2 := []Match_Result{{5}}
+    d1 := []Match_Result{{offset = 5}, {offset = 5}}
+    d2 := []Match_Result{{offset = 5}}
     rd := merge_ordered_matches([][]Match_Result{ d1, d2 })
     testing.expect_value(t, len(rd), 3)
     for m in rd {
@@ -79,8 +79,8 @@ test_merge_ordered_matches_empty_entries_and_duplicates :: proc(t: ^testing.T) {
     delete(rd)
 
     // 极端：某一列表整体小于另一列表
-    big := []Match_Result{{100}, {200}, {300}}
-    small := []Match_Result{{1}}
+    big := []Match_Result{{offset = 100}, {offset = 200}, {offset = 300}}
+    small := []Match_Result{{offset = 1}}
     rs := merge_ordered_matches([][]Match_Result{ big, small })
     testing.expect_value(t, len(rs), 4)
     testing.expect_value(t, rs[0].offset, u64(1))

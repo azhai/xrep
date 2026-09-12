@@ -15,7 +15,8 @@ package main
 import "core:sync"
 
 Output_Item :: struct {
-    offset: u64,
+    offset:  u64,
+    pat_len: u32, // 命中长度：多模式时可能是任一模式的长度；0 表示未标注
 }
 
 Output_Queue :: struct {

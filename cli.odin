@@ -7,7 +7,7 @@ package main
 //       退出策略交给调用方（main），于是参数解析可以被单元测试完整覆盖
 //       （含所有错误分支），这是本模块拆分出的主要动机。
 //
-// 依赖：core:fmt、core:strconv、core:sys/info。
+// 依赖：core:fmt、core:strconv、core:strings、core:os、core:sys/info。
 //
 // 结果 Parse_Outcome：
 //   .Ok      → 解析成功，继续主流程
@@ -15,13 +15,19 @@ package main
 //   .Version → 调用方打印版本并退出 0
 //   .Error   → 调用方把 message 写入 stderr 并退出 1
 //
-// 行为保持要点（与拆分前逐条一致）：
-//   - `--help` 在遍历中**即时生效**：出现在它之后的参数不会被解析，
+// 行为保持要点：
+//   - `--help` / `--version` 在遍历中**即时生效**：出现在它之后的参数不会被解析，
 //     因此 `--threads abc --help` 仍然以 1 退出（先撞上 --threads 的错误）。
-//     `--version` 同样即时生效。
 //   - `--dump` 与 `--dump-prefix` 互斥，检查发生在遍历结束之后、
 //     在 --test/--bench 判定之前。
-//   - 第一个非 flag 参数是模式，其余非 flag 参数是文件列表。
+//   - 没有 `-e` 时：第一个非 flag 参数是模式，其余非 flag 参数是文件列表。
+//     有 `-e` 时：**所有**非 flag 参数都是文件列表（与 grep 一致）。
+//
+// 参数规范化（normalize_args，新增）：
+//   为了同时支持 `--threads=N` 与短别名 `-t N` / `-tN` / 布尔捆绑 `-rn`，
+//   解析前先把 argv 规范化为"长 flag + 独立值"的 token 序列，主循环只认长名。
+//   规范化对**未知**短 flag 不做任何展开（原样保留），因此像 `-foo` 这样的
+//   参数仍然落到位置参数分支，行为与加短别名之前一致。
 //
 // 注意：parse_args 保持"纯数据"——不探测硬件、不夹取线程数。
 //       --threads 的合法性由 main 调用 clamp_thread_count 处理，这样解析结果
@@ -29,13 +35,31 @@ package main
 // ============================================================================
 
 import "core:fmt"
+import "core:os"
 import "core:strconv"
+import "core:strings"
 import info "core:sys/info"
 
+// -l / -L 的模式：列出"有命中"或"无命中"的文件。
+List_Mode :: enum {
+    None, // 默认：打印命中明细
+    Files_With, // -l：只列有命中的文件名
+    Files_Without, // -L：只列无命中的文件名
+}
+
 // 解析后的全部运行选项。字段默认值与拆分前的局部变量初始化一一对应。
+//
+// 内存所有权（重要）：以下字段由 parse_args 分配，**调用方必须调用
+// options_destroy 释放**（main 会调用；单元测试也必须调用，否则内存追踪器报 leak）：
+//   file_list / patterns / pattern_extra / globs / excludes / pattern_buffers
+// 其中各字符串元素多为 os.args 的视图（不单独释放），
+// 只有 pattern_buffers 里的内容是真正分配的（`-f FILE` 读入的文件内容）。
 Options :: struct {
-    pattern:       []u8, // 第一个非 flag 参数；空表示未提供
-    file_list:     [dynamic]string, // 其余非 flag 参数（**调用方负责 delete**，见 parse_args）
+    pattern:       []u8, // 主模式（无 -e 时来自位置参数；有 -e 时即 patterns[0]）
+    patterns:      [dynamic]string, // -e / -f 收集到的全部模式（可空）
+    pattern_extra: [][]u8, // patterns[1:] 的字节视图；由 match_ctx_from_options 填充
+    pattern_buffers: [dynamic][]byte, // -f 读入的文件内容（真正分配，需释放）
+    file_list:     [dynamic]string, // 其余非 flag 参数
     ignore_case:   bool, // --ignore-case
     limit:         uint, // --limit N（0 = 不截断 pretty 输出）
     after:         u64, // --after N，命中偏移下界
@@ -52,6 +76,21 @@ Options :: struct {
     skip_empty:    bool, // --skip-empty：命中 0 条时不产出 dump 文件
     dump_append:   bool, // --dump-append：dump 改为追加写
     max_size:      u64, // --max-size N：跳过大于 N 字节的文件（0 = 不限制）
+
+    // ---- 目录遍历（对齐 krep）----
+    recursive: bool, // -r / --recursive
+    hidden:    bool, // --hidden
+    globs:     [dynamic]string, // --glob，可重复
+    excludes:  [dynamic]string, // --exclude，可重复
+
+    // ---- 输出与匹配（对齐 krep）----
+    line_numbers:  bool, // -n / --line-number
+    only_matching: bool, // -o / --only-matching
+    max_count:     uint, // -m / --max-count（0 = 不限）
+    json:          bool, // --json / --jsonl
+    stats:         bool, // --stats
+    color_mode:    Color_Mode, // --color=WHEN / --no-color
+    list_mode:     List_Mode, // -l / -L
 }
 
 Parse_Outcome :: enum {
@@ -61,109 +100,324 @@ Parse_Outcome :: enum {
     Error,
 }
 
+// ---------------------------------------------------------------------------
+// 短 flag 映射与参数规范化
+// ---------------------------------------------------------------------------
+
+// 该短 flag 是否需要一个值（形如 `-t 8` / `-t8`）。
+short_takes_value :: proc(c: u8) -> bool {
+    switch c {
+    case 't', 'm', 'e', 'g', 'f':
+        return true
+    }
+    return false
+}
+
+// 短 flag → 长 flag 名；返回空串表示"不是已知短 flag"。
+short_to_long :: proc(c: u8) -> string {
+    switch c {
+    case 'i':
+        return "--ignore-case"
+    case 'c':
+        return "--count"
+    case 'q':
+        return "--quiet"
+    case 'v':
+        return "--version"
+    case 'h':
+        return "--help"
+    case 'n':
+        return "--line-number"
+    case 'o':
+        return "--only-matching"
+    case 'l':
+        return "--files-with-matches"
+    case 'L':
+        return "--files-without-match"
+    case 'r':
+        return "--recursive"
+    case 't':
+        return "--threads"
+    case 'm':
+        return "--max-count"
+    case 'e':
+        return "--pattern"
+    case 'g':
+        return "--glob"
+    case 'f':
+        return "--file"
+    }
+    return ""
+}
+
+// 规范化为"长 flag + 独立值"token 序列。返回的动态数组归调用方所有。
+//   `--threads=8`  → "--threads" "8"
+//   `-rn`          → "-r" 分支展开为 "--recursive" "--line-number"
+//   `-t8`          → "--threads" "8"
+//   `-e` "pat"     → "--pattern" "pat"（值留在下一个 token，主循环照常取用）
+//   `-foo`         → 原样（未知短 flag 不展开）
+normalize_args :: proc(args: []string) -> [dynamic]string {
+    out: [dynamic]string
+    for a in args {
+        // ---- 长 flag：`--name=value` ----
+        if len(a) >= 3 && a[0] == '-' && a[1] == '-' {
+            eq := -1
+            for i in 2..<len(a) {
+                if a[i] == '=' {
+                    eq = i
+                    break
+                }
+            }
+            if eq > 2 {
+                append(&out, a[:eq])
+                append(&out, a[eq + 1:])
+                continue
+            }
+            append(&out, a)
+            continue
+        }
+        // ---- 短 flag 簇：`-abc` / `-t8` ----
+        if len(a) >= 2 && a[0] == '-' && a[1] != '-' {
+            valid := true
+            for i in 1..<len(a) {
+                if len(short_to_long(a[i])) == 0 {
+                    valid = false
+                    break
+                }
+                if short_takes_value(a[i]) {
+                    break // 其后是值，不再当作 flag 校验
+                }
+            }
+            if valid {
+                i := 1
+                for i < len(a) {
+                    c := a[i]
+                    append(&out, short_to_long(c))
+                    i += 1
+                    if short_takes_value(c) {
+                        if i < len(a) {
+                            append(&out, a[i:]) // `-t8` 的 8
+                        }
+                        break
+                    }
+                }
+                continue
+            }
+        }
+        append(&out, a)
+    }
+    return out
+}
+
+// 解析 --color=WHEN：always / never / auto。
+parse_color_mode :: proc(v: string) -> (mode: Color_Mode, ok: bool) {
+    switch v {
+    case "always", "yes", "force":
+        return .Always, true
+    case "never", "no", "none":
+        return .Never, true
+    case "auto", "tty":
+        return .Auto, true
+    }
+    return .Auto, false
+}
+
+// 从 `-f FILE` 读入模式文件；每个非空行是一个模式（行尾 CRLF 的 \r 会被剥掉）。
+// 内容缓冲挂到 opts.pattern_buffers 上统一释放，模式字符串是指向它的视图。
+read_pattern_file :: proc(opts: ^Options, path: string) -> (ok: bool, message: string) {
+    buf, err := os.read_entire_file(path, context.allocator)
+    if err != nil {
+        return false, fmt.tprintf("cannot read pattern file: %s", path)
+    }
+    append(&opts.pattern_buffers, buf)
+    start := 0
+    for i := 0; i <= len(buf); i += 1 {
+        if i == len(buf) || buf[i] == '\n' {
+            line := buf[start:i]
+            if len(line) > 0 && line[len(line) - 1] == '\r' {
+                line = line[:len(line) - 1]
+            }
+            if len(line) > 0 {
+                append(&opts.patterns, transmute(string)line)
+            }
+            start = i + 1
+        }
+    }
+    return true, ""
+}
+
 // 解析参数。args 通常为 os.args[1:]（不含程序名）。
 // 返回的 message 不含换行，由调用方决定输出目标与格式。
-//
-// 内存所有权：返回的 Options.file_list 是动态数组，**由调用方负责 delete**
-// （main 会释放；单元测试也必须释放，否则内存追踪器会报 leak）。
-// 该数组按需分配：没有文件参数时保持为 nil，`len()` 语义不变。
 parse_args :: proc(args: []string) -> (opts: Options, outcome: Parse_Outcome, message: string) {
-    // 默认值：线程数 4；before 上界为 u64 最大值（等价"不设上界"）。
+    // 默认值：线程数 4；before 上界为 u64 最大值（等价"不设上界"）；
+    // 颜色默认 always —— 与加 --color 之前的行为完全一致（原 use_color 恒为 true）。
+    // 想跟随终端能力请显式 `--color=auto`。
     opts.thread_count = DEFAULT_THREAD_COUNT
     opts.before = 0xFFFFFFFFFFFFFFFF
-    // 注意：file_list 刻意不在这里 make —— 走 --help/--version/--test/--bench
-    // 或参数报错路径时不需要它；首次 append 时 Odin 会自动分配（nil 动态数组可 append）。
+    opts.color_mode = .Always
+
+    norm := normalize_args(args)
+    defer delete(norm)
+
+    // 位置参数先收集，解析结束后再决定"第一个是模式还是文件"：
+    // 因为 `-e` 可能出现在文件参数之后，只有遍历完才知道有没有它。
+    positional: [dynamic]string
+    defer delete(positional)
 
     arg_idx := 0
-    for arg_idx < len(args) {
-        arg := args[arg_idx]
+    for arg_idx < len(norm) {
+        arg := norm[arg_idx]
         arg_idx += 1
         switch arg {
-        case "--threads":
-            if arg_idx >= len(args) {
+        case "--threads", "-t":
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--threads requires number"
             }
-            n, ok := strconv.parse_uint(args[arg_idx], 10)
+            n, ok := strconv.parse_uint(norm[arg_idx], 10)
             arg_idx += 1
             if !ok {
-                return opts, .Error, fmt.tprintf("invalid threads: %s", args[arg_idx - 1])
+                return opts, .Error, fmt.tprintf("invalid threads: %s", norm[arg_idx - 1])
             }
             opts.thread_count = uint(n)
-        case "--ignore-case":
+        case "--ignore-case", "-i":
             opts.ignore_case = true
         case "--limit":
-            if arg_idx >= len(args) {
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--limit requires number"
             }
-            n, ok := strconv.parse_uint(args[arg_idx], 10)
+            n, ok := strconv.parse_uint(norm[arg_idx], 10)
             arg_idx += 1
             if !ok {
-                return opts, .Error, fmt.tprintf("invalid limit: %s", args[arg_idx - 1])
+                return opts, .Error, fmt.tprintf("invalid limit: %s", norm[arg_idx - 1])
             }
             opts.limit = uint(n)
-        case "--after":
-            if arg_idx >= len(args) {
-                return opts, .Error, "--after requires offset"
+        case "--max-count", "-m":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--max-count requires number"
             }
-            n, ok := strconv.parse_uint(args[arg_idx], 0) // base 0：同时接受 0x 前缀
+            n, ok := strconv.parse_uint(norm[arg_idx], 10)
             arg_idx += 1
             if !ok {
-                return opts, .Error, fmt.tprintf("invalid after offset: %s", args[arg_idx - 1])
+                return opts, .Error, fmt.tprintf("invalid max-count: %s", norm[arg_idx - 1])
+            }
+            opts.max_count = uint(n)
+        case "--after":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--after requires offset"
+            }
+            n, ok := strconv.parse_uint(norm[arg_idx], 0) // base 0：同时接受 0x 前缀
+            arg_idx += 1
+            if !ok {
+                return opts, .Error, fmt.tprintf("invalid after offset: %s", norm[arg_idx - 1])
             }
             opts.after = u64(n)
         case "--before":
-            if arg_idx >= len(args) {
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--before requires offset"
             }
-            n, ok := strconv.parse_uint(args[arg_idx], 0)
+            n, ok := strconv.parse_uint(norm[arg_idx], 0)
             arg_idx += 1
             if !ok {
-                return opts, .Error, fmt.tprintf("invalid before offset: %s", args[arg_idx - 1])
+                return opts, .Error, fmt.tprintf("invalid before offset: %s", norm[arg_idx - 1])
             }
             opts.before = u64(n)
         case "--context":
-            if arg_idx >= len(args) {
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--context requires byte count"
             }
-            n, ok := strconv.parse_uint(args[arg_idx], 10)
+            n, ok := strconv.parse_uint(norm[arg_idx], 10)
             arg_idx += 1
             if !ok {
-                return opts, .Error, fmt.tprintf("invalid context: %s", args[arg_idx - 1])
+                return opts, .Error, fmt.tprintf("invalid context: %s", norm[arg_idx - 1])
             }
             opts.context_bytes = uint(n)
-        case "--count":
+        case "--count", "-c":
             opts.only_count = true
+        case "--line-number", "-n":
+            opts.line_numbers = true
+        case "--only-matching", "-o":
+            opts.only_matching = true
+        case "--recursive", "-r":
+            opts.recursive = true
+        case "--hidden":
+            opts.hidden = true
+        case "--files-with-matches", "-l":
+            opts.list_mode = .Files_With
+        case "--files-without-match", "-L":
+            opts.list_mode = .Files_Without
+        case "--json", "--jsonl":
+            opts.json = true
+        case "--stats":
+            opts.stats = true
         case "--no-color":
-            // 颜色由 use_color 固定为 true，此标志接受但不改行为（防止终端转义混淆）。
-            // 保留解析分支以免既有脚本误报 "unknown flag"。
+            // 语义已生效：等价 `--color=never`（历史上是 no-op，见 README 契约#4）。
+            opts.color_mode = .Never
+        case "--color":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--color requires WHEN (always|never|auto)"
+            }
+            mode, ok := parse_color_mode(norm[arg_idx])
+            arg_idx += 1
+            if !ok {
+                return opts, .Error, fmt.tprintf("invalid color mode: %s", norm[arg_idx - 1])
+            }
+            opts.color_mode = mode
+        case "--glob", "-g":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--glob requires a pattern"
+            }
+            append(&opts.globs, norm[arg_idx])
+            arg_idx += 1
+        case "--exclude":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--exclude requires a pattern"
+            }
+            append(&opts.excludes, norm[arg_idx])
+            arg_idx += 1
+        case "--pattern", "-e":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--pattern requires a value"
+            }
+            append(&opts.patterns, norm[arg_idx])
+            arg_idx += 1
+        case "--file", "-f":
+            if arg_idx >= len(norm) {
+                return opts, .Error, "--file requires a path"
+            }
+            fpath := norm[arg_idx]
+            arg_idx += 1
+            ok, msg := read_pattern_file(&opts, fpath)
+            if !ok {
+                return opts, .Error, msg
+            }
         case "--offset-hex":
             opts.offset_hex = true
         case "--dump":
-            if arg_idx >= len(args) {
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--dump requires output file"
             }
-            opts.dump_path = args[arg_idx]
+            opts.dump_path = norm[arg_idx]
             arg_idx += 1
         case "--dump-prefix":
-            if arg_idx >= len(args) {
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--dump-prefix requires prefix string"
             }
-            opts.dump_prefix = args[arg_idx]
+            opts.dump_prefix = norm[arg_idx]
             arg_idx += 1
-        case "--quiet":
+        case "--quiet", "-q":
             opts.quiet = true
         case "--skip-empty":
             opts.skip_empty = true
         case "--dump-append":
             opts.dump_append = true
         case "--max-size":
-            if arg_idx >= len(args) {
+            if arg_idx >= len(norm) {
                 return opts, .Error, "--max-size requires byte count"
             }
-            n, ok := strconv.parse_uint(args[arg_idx], 10)
+            n, ok := strconv.parse_uint(norm[arg_idx], 10)
             arg_idx += 1
             if !ok {
-                return opts, .Error, fmt.tprintf("invalid max-size: %s", args[arg_idx - 1])
+                return opts, .Error, fmt.tprintf("invalid max-size: %s", norm[arg_idx - 1])
             }
             opts.max_size = u64(n)
         case "--test":
@@ -177,13 +431,29 @@ parse_args :: proc(args: []string) -> (opts: Options, outcome: Parse_Outcome, me
             // 即时退出：后续参数不再解析（与拆分前行为一致）。
             return opts, .Help, ""
         case:
-            // 第一个非flag作为pattern，其余作为文件列表
+            append(&positional, arg)
+        }
+    }
+
+    // ---- 位置参数的归属：有 -e/-f 时全部是文件，否则第一个非空者才是模式 ----
+    // 注意"非空"这个判据：既有语义用 `len(opts.pattern) == 0` 判断模式位是否已占用，
+    // 因此空字符串参数**不占位**（`xrep "" file.bin` 里 file.bin 才是模式）。
+    // 这是被单元测试钉住的兼容行为，不能用"位置下标 == 0"来替代。
+    if len(opts.patterns) > 0 {
+        for p in positional {
+            append(&opts.file_list, p)
+        }
+    } else {
+        for p in positional {
             if len(opts.pattern) == 0 {
-                opts.pattern = s2b(arg)
+                opts.pattern = s2b(p)
             } else {
-                append(&opts.file_list, arg)
+                append(&opts.file_list, p)
             }
         }
+    }
+    if len(opts.patterns) > 0 {
+        opts.pattern = s2b(opts.patterns[0])
     }
 
     // 互斥检查：--dump 和 --dump-prefix 不能同时使用
@@ -192,6 +462,38 @@ parse_args :: proc(args: []string) -> (opts: Options, outcome: Parse_Outcome, me
     }
 
     return opts, .Ok, ""
+}
+
+// 由选项构造匹配上下文。pattern_extra 在此一次性分配（patterns[1:] 的字节视图），
+// 由调用方通过 options_destroy 释放。
+match_ctx_from_options :: proc(opts: ^Options) -> Match_Ctx {
+    if opts.pattern_extra == nil && len(opts.patterns) > 1 {
+        extra := make([][]u8, len(opts.patterns) - 1)
+        for i in 1..<len(opts.patterns) {
+            extra[i - 1] = s2b(opts.patterns[i])
+        }
+        opts.pattern_extra = extra
+    }
+    return Match_Ctx{
+        pattern = opts.pattern,
+        case_insensitive = opts.ignore_case,
+        extra = opts.pattern_extra,
+    }
+}
+
+// 释放 parse_args 拥有的全部资源（见 Options 的"内存所有权"说明）。
+options_destroy :: proc(opts: ^Options) {
+    delete(opts.file_list)
+    delete(opts.patterns)
+    delete(opts.globs)
+    delete(opts.excludes)
+    if opts.pattern_extra != nil {
+        delete(opts.pattern_extra)
+    }
+    for buf in opts.pattern_buffers {
+        delete(buf)
+    }
+    delete(opts.pattern_buffers)
 }
 
 // 本机允许的最大 worker 线程数 = 逻辑核心数 × MAX_THREADS_FACTOR。
@@ -206,33 +508,59 @@ max_threads_for_machine :: proc() -> uint {
 
 print_help :: proc() {
     fmt.println("xrep - fast binary pattern search tool")
-    fmt.println("Usage: xrep <pattern> [files...] [flags]")
-    fmt.println("Flags:")
-    fmt.println("  --threads N     set worker thread count (clamped to 1..cpu*4)")
-    fmt.println("  --ignore-case   case insensitive match")
-    fmt.println("  --limit N       limit pretty summary items (0 = unlimited)")
-    fmt.println("  --after N       offset >= N")
-    fmt.println("  --before N      offset <= N")
-    fmt.println("  --context N     show N bytes context hex")
-    fmt.println("  --count         only output hit count")
-    fmt.println("  --offset-hex    print offset in hexadecimal")
-    fmt.println("  --dump FILE     write all matched offsets to single file")
-    fmt.println("  --dump-prefix P write per-file dump: P{sanitized filename}.txt")
-    fmt.println("  --dump-append   append to dump file instead of overwriting")
-    fmt.println("  --skip-empty    do not create dump files for files with 0 hits")
-    fmt.println("  --max-size N    skip files larger than N bytes")
-    fmt.println("  --quiet         quiet mode: no stdout, only dump + stderr errors")
-    fmt.println("  --test          run unit tests")
-    fmt.println("  --bench         run benchmark")
-    fmt.println("  -v,--version    show version")
-    fmt.println("  -h,--help       show this help")
+    fmt.println("Usage: xrep <pattern> [files/dirs...] [flags]")
+    fmt.println()
+    fmt.println("Matching:")
+    fmt.println("  -i,--ignore-case     case insensitive match")
+    fmt.println("  -e,--pattern PATTERN add pattern (repeatable, multiple patterns)")
+    fmt.println("  -f,--file FILE       read patterns line by line from FILE")
+    fmt.println("  --after N            offset >= N")
+    fmt.println("  --before N           offset <= N")
+    fmt.println("  -m,--max-count N     report at most N matches per file (0 = unlimited)")
+    fmt.println("  --limit N            limit pretty summary items (0 = unlimited)")
+    fmt.println()
+    fmt.println("Searching:")
+    fmt.println("  -r,--recursive       search directories recursively")
+    fmt.println("  -g,--glob GLOB       only files matching GLOB (repeatable)")
+    fmt.println("  --exclude GLOB       skip files/dirs matching GLOB (repeatable)")
+    fmt.println("  --hidden             include dotfiles (default: skipped)")
+    fmt.println("  --max-size N         skip files larger than N bytes")
+    fmt.println("  -t,--threads N       worker thread count (clamped to 1..cpu*4)")
+    fmt.println()
+    fmt.println("Output:")
+    fmt.println("  -c,--count           only print hit count per file")
+    fmt.println("  -n,--line-number     include 1-based line number")
+    fmt.println("  -o,--only-matching   also print the matched bytes in hex")
+    fmt.println("  -l,--files-with-matches    print only names of files with matches")
+    fmt.println("  -L,--files-without-match   print only names of files without matches")
+    fmt.println("  --context N          show N bytes context in hex")
+    fmt.println("  --offset-hex         print offsets in hexadecimal")
+    fmt.println("  --json,--jsonl       JSON Lines output")
+    fmt.println("  --color WHEN         always|never|auto (default: always)")
+    fmt.println("  --stats              print run summary to stderr")
+    fmt.println("  --quiet,-q           no stdout (dump + stderr errors only)")
+    fmt.println()
+    fmt.println("Dump:")
+    fmt.println("  --dump FILE          write all matched offsets to single file")
+    fmt.println("  --dump-prefix P      write per-file dump: P{sanitized filename}.txt")
+    fmt.println("  --dump-append        append to dump file instead of overwriting")
+    fmt.println("  --skip-empty         do not create dump files for files with 0 hits")
+    fmt.println()
+    fmt.println("Misc:")
+    fmt.println("  --test               run built-in self test")
+    fmt.println("  --bench              run benchmark")
+    fmt.println("  -v,--version         show version")
+    fmt.println("  -h,--help            show this help")
     fmt.println()
     fmt.println("Examples:")
-    fmt.println("  xrep ABC data.bin                      # match ABC in one file")
-    fmt.println("  xrep abc f.bin --ignore-case --count   # case-insensitive count")
-    fmt.println("  xrep GET app.log --dump hits.txt       # dump offsets to hits.txt")
-    fmt.println("  xrep GET *.log --dump-prefix out_      # per-file dumps out_*.txt")
-    fmt.println("  xrep GET big.bin --max-size 104857600  # skip files over 100 MiB")
+    fmt.println("  xrep ABC data.bin                       # match ABC in one file")
+    fmt.println("  xrep abc f.bin -i -c                    # case-insensitive count")
+    fmt.println("  xrep GET -r ./logs --glob '*.log'       # recursive over *.log")
+    fmt.println("  xrep TODO -r src --exclude '*.min.js'   # add exclusions")
+    fmt.println("  xrep -e foo -e bar -r . -n              # multi-pattern with line numbers")
+    fmt.println("  xrep GET app.log --json --stats         # JSON Lines + summary")
+    fmt.println("  xrep GET big.bin --max-size 104857600   # skip files over 100 MiB")
+    fmt.println("  xrep GET *.log --dump-prefix out_       # per-file dumps out_*.txt")
 }
 
 print_version :: proc() {

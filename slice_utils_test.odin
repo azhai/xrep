@@ -124,7 +124,7 @@ test_slice_sort :: proc(t: ^testing.T) {
     testing.expect(t, slice.equal(dup, []int{1, 2, 2, 2}))
     // 结构体场景（Match_Result 按 offset 排序）
     mr_less :: proc(x, y: Match_Result) -> bool { return x.offset < y.offset }
-    ms := []Match_Result{{9}, {0}, {4}, {4}}
+    ms := []Match_Result{{offset = 9}, {offset = 0}, {offset = 4}, {offset = 4}}
     slice_sort(Match_Result, ms, mr_less)
     testing.expect_value(t, ms[0].offset, u64(0))
     testing.expect_value(t, ms[1].offset, u64(4))
