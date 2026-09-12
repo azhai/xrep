@@ -1,0 +1,10 @@
+/.editor_settings
+/.editorconfig
+/.internal
+/build
+/xrep
+.DS_Store
+.codebuddy/
+.gitattributes
+.workbuddy/
+Thumbs.db
