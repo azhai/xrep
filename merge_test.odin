@@ -87,3 +87,75 @@ test_merge_ordered_matches_empty_entries_and_duplicates :: proc(t: ^testing.T) {
     testing.expect_value(t, rs[3].offset, u64(300))
     delete(rs)
 }
+
+@(test)
+test_merge_ordered_matches_many_lists_multiset :: proc(t: ^testing.T) {
+    // 多路（= 线程数）压力：8 个分片各含若干命中，要求
+    //   1. 输出全局非降序；
+    //   2. 输出与输入是同一个**多重集**（既不丢也不多）。
+    // 用确定性伪随机构造各分片（偏移刻意大量重叠，模拟分片重叠窗口的重复命中）。
+    LISTS :: 8
+    PER_LIST :: 60
+    OFFSET_MAX :: 200
+
+    rng: u32 = 0x9E3779B9
+    lists := make([][]Match_Result, LISTS)
+    defer delete(lists)
+    expected := make([]int, OFFSET_MAX)
+    defer delete(expected)
+    total := 0
+    for l in 0..<LISTS {
+        // 每个分片内的偏移按构造即升序（归并的前提）
+        row := make([dynamic]Match_Result, 0, PER_LIST)
+        prev := u64(0)
+        for _ in 0..<PER_LIST {
+            rng = rng * 1664525 + 1013904223
+            off := u64((rng >> 16) % OFFSET_MAX)
+            if off < prev {
+                off = prev // 保证本分片升序
+            }
+            append(&row, Match_Result{offset = off, pat_len = 4})
+            expected[off] += 1
+            prev = off
+        }
+        lists[l] = row[:]
+        total += len(lists[l])
+    }
+
+    r := merge_ordered_matches(lists)
+    defer delete(r)
+
+    testing.expect_value(t, len(r), total)
+    for i in 1..<len(r) {
+        testing.expectf(t, r[i - 1].offset <= r[i].offset, "第 %d 条(%d) > 第 %d 条(%d)", i - 1, r[i - 1].offset, i, r[i].offset)
+    }
+    got := make([]int, OFFSET_MAX)
+    defer delete(got)
+    for m in r {
+        testing.expectf(t, m.offset < u64(OFFSET_MAX), "偏移 %d 超出构造范围", m.offset)
+        if m.offset < u64(OFFSET_MAX) {
+            got[m.offset] += 1
+        }
+    }
+    for i in 0..<OFFSET_MAX {
+        testing.expectf(t, got[i] == expected[i], "偏移 %d: 输出 %d 次，输入 %d 次", i, got[i], expected[i])
+    }
+
+    // 释放各分片（它们由当前分配器分配，归并只读取不接管所有权）
+    for lst in lists {
+        delete(lst)
+    }
+}
+
+@(test)
+test_merge_ordered_matches_all_identical_offsets :: proc(t: ^testing.T) {
+    // 全部命中偏移相同时，长度必须守恒（相等偏移之间的先后由实现决定，
+    // 但一条都不能少 —— 这正是"重叠窗口重复命中"的极限形态）。
+    same := []Match_Result{{offset = 7}, {offset = 7}, {offset = 7}}
+    r := merge_ordered_matches([][]Match_Result{ same, same, same })
+    testing.expect_value(t, len(r), 9)
+    for m in r {
+        testing.expect_value(t, m.offset, u64(7))
+    }
+    delete(r)
+}

@@ -8,6 +8,10 @@ package main
 //   * single_match / naive_match 的正确性（重叠命中、大小写、空数据、模式超长）
 //   * bndm_match 与 naive_match 的委托一致性
 //   * 三种算法在同一输入上的结果一致性
+//   * **差分测试**：把各算法与一个"独立参考实现"（core:strings 的 index）
+//     在确定性伪随机数据上逐条比对 —— 覆盖 8 种模式 × 大小写两态
+//   * multi_match 的命中集合 == 各单模式命中集合的多重集并集
+//   * 各算法向 Progress 上报的已扫字节数
 //
 // 内存约定：命中数组由默认分配器（堆）承载，不再由 arena 承载 —— arena 定长，
 //           超容量时 append 会静默丢命中（见 matcher.odin 文件头 / ADR 0004）。
@@ -17,6 +21,9 @@ package main
 // ============================================================================
 
 
+import "core:fmt"
+import "core:slice"
+import "core:strings"
 import "core:testing"
 
 // 构造一个关闭渲染的进度条，避免测试输出被进度条干扰。
@@ -349,4 +356,214 @@ test_dense_results_not_truncated :: proc(t: ^testing.T) {
     // 首尾命中偏移必须正确（防止"数量对但内容错"的伪修复）
     testing.expect_value(t, got[0].offset, u64(0))
     testing.expect_value(t, got[N - 1].offset, u64(N - 1))
+}
+
+// ---------------------------------------------------------------------------
+// 差分测试：与独立参考实现逐条比对
+//
+// 为什么要差分而不是再手写一遍期望值：把"手写的朴素比较"再抄一遍当断言，
+// 等于把同一处理解错误复制两份。这里改用 core:strings 的 index 作为**预言机**
+// —— 它与被测实现没有共享代码路径，因此任何一边写错都会立刻暴露。
+// ---------------------------------------------------------------------------
+
+// 参考实现：反复用标准库子串查找定位下一个命中，保留重叠。
+// 前提：调用方已把两侧的大小写统一（大小写不敏感时先整体小写化）。
+ref_offsets :: proc(data: []u8, pat: []u8) -> [dynamic]u64 {
+    out: [dynamic]u64
+    n := len(data)
+    m := len(pat)
+    if m == 0 || m > n {
+        return out
+    }
+    hay := transmute(string)data
+    needle := transmute(string)pat
+    start := 0
+    for start + m <= n {
+        rel := strings.index(hay[start:], needle)
+        if rel < 0 {
+            break
+        }
+        abs := start + rel
+        append(&out, u64(abs))
+        start = abs + 1 // +1：保留重叠命中（"aaaa" 匹配 "aa" 有 3 处）
+    }
+    return out
+}
+
+// 断言 got 与参考实现的偏移序列（含顺序与 pat_len）逐条一致。
+expect_same_offsets :: proc(t: ^testing.T, what: string, got: []Match_Result, want: []u64, pat_len: uint) {
+    testing.expectf(t, len(got) == len(want), "%s: 命中 %d 条，参考实现 %d 条", what, len(got), len(want))
+    if len(got) != len(want) {
+        return
+    }
+    for i in 0..<len(got) {
+        testing.expectf(t, got[i].offset == want[i], "%s: 第 %d 条偏移 %d，参考 %d", what, i, got[i].offset, want[i])
+        testing.expectf(t, uint(got[i].pat_len) == pat_len, "%s: 第 %d 条 pat_len=%d，期望 %d", what, i, got[i].pat_len, pat_len)
+    }
+}
+
+@(test)
+test_matchers_agree_with_reference_search :: proc(t: ^testing.T) {
+    p := test_progress()
+
+    // 确定性伪随机数据（LCG，固定种子）：字母表刻意小 → 模式会反复命中；
+    // 再手工埋三处实例，覆盖重叠（ababa）、大小写（AAAAA）与数据末尾（abab）。
+    rng: u32 = 0x2468ACE1
+    data := make([]u8, 4096)
+    defer delete(data)
+    for i in 0..<len(data) {
+        rng = rng * 1664525 + 1013904223
+        data[i] = u8('a' + (rng >> 16) % 5) // a..e
+    }
+    copy(data[100:105], s2b("ababa"))
+    copy(data[2000:2005], s2b("AAAAA"))
+    copy(data[4092:4096], s2b("abab"))
+
+    // 大小写不敏感时整体小写化的数据（等价于 lower_table，但走标准库路径）。
+    // 声明在循环之外 → defer 落在函数体顶层，生存期覆盖整个用例。
+    low_data := strings.to_lower(transmute(string)data)
+    defer delete(low_data)
+
+    patterns := [][]u8{
+        s2b("a"), // 1 字节 → single_match
+        s2b("b"),
+        s2b("ab"), // 2..16 → bndm_match（委托 naive）
+        s2b("aba"),
+        s2b("bab"),
+        s2b("ababa"),
+        s2b("bcbc"),
+        s2b("abc"), // 无命中
+        s2b("abababababab"), // 12 字节
+        s2b("e"), // 末字母，逼近数据尾部
+    }
+    ci_cases := []bool{false, true}
+
+    for pat in patterns {
+        for ci in ci_cases {
+            want: [dynamic]u64
+            if ci {
+                // low_pat 的生存期只覆盖这一次 ref_offsets 调用，因此**手工 delete**：
+                // 写在 if 里的 defer 会在 if 块结束时立即释放（Odin defer 是块作用域），
+                // 而低写的 ref_data 还要给后面三条比对用 —— 提前 free 会让断言读到
+                // 已释放内存（曾表现为"参考实现少报一半命中"）。
+                low_pat := strings.to_lower(transmute(string)pat)
+                want = ref_offsets(transmute([]u8)low_data, transmute([]u8)low_pat)
+                delete(low_pat)
+            } else {
+                want = ref_offsets(data, pat)
+            }
+            defer delete(want)
+
+            label := fmt.aprintf("pat=%q ci=%v", transmute(string)pat, ci)
+            defer delete(label)
+
+            ctx := Match_Ctx{pattern = pat, case_insensitive = ci}
+
+            // 1) 真实分派路径（select_matcher_for）：这是 worker 实际调用的东西
+            dispatch := select_matcher_for(ctx)
+            got_dispatch := dispatch(data, ctx, &p)
+            defer delete(got_dispatch)
+            expect_same_offsets(t, label, got_dispatch, want[:], uint(len(pat)))
+
+            // 2) naive_match：任意长度的兜底实现必须始终正确
+            got_naive := naive_match(data, ctx, &p)
+            defer delete(got_naive)
+            expect_same_offsets(t, label, got_naive, want[:], uint(len(pat)))
+
+            // 3) multi_match：无 extra 时等价于单模式（模式表长度为 1）
+            got_multi := multi_match(data, ctx, &p)
+            defer delete(got_multi)
+            expect_same_offsets(t, label, got_multi, want[:], uint(len(pat)))
+        }
+    }
+}
+
+@(test)
+test_multi_match_equals_union_of_single_matches :: proc(t: ^testing.T) {
+    // 多模式不是"某种合并"，而是各单模式命中结果的**多重集并集**：
+    // 同一偏移被多个模式命中就出现多条（不去重，与分片重叠的重复语义一致）。
+    p := test_progress()
+    data := s2b("foo test bar testfoo") // test@4 foo@0/17 bar@9
+    pats := [][]u8{s2b("test"), s2b("foo"), s2b("bar")}
+    ctx := Match_Ctx{pattern = pats[0], extra = [][]u8{pats[1], pats[2]}}
+
+    got := multi_match(data, ctx, &p)
+    defer delete(got)
+
+    n := len(data)
+    from_multi := make([]int, n)
+    defer delete(from_multi)
+    from_union := make([]int, n)
+    defer delete(from_union)
+    for m in got {
+        from_multi[m.offset] += 1
+    }
+    for pat in pats {
+        one := naive_match(data, Match_Ctx{pattern = pat, case_insensitive = false}, &p)
+        defer delete(one)
+        for r in one {
+            from_union[r.offset] += 1
+        }
+    }
+    for i in 0..<n {
+        testing.expectf(
+            t,
+            from_multi[i] == from_union[i],
+            "偏移 %d: multi_match=%d，单模式并集=%d",
+            i,
+            from_multi[i],
+            from_union[i],
+        )
+    }
+
+    // 每条命中的 pat_len 必须与"确实在该偏移命中的某个模式"长度相符
+    for m in got {
+        off := int(m.offset)
+        plen := int(m.pat_len)
+        matched := false
+        for pat in pats {
+            if len(pat) == plen && slice.equal(data[off:off + plen], pat) {
+                matched = true
+            }
+        }
+        testing.expectf(t, matched, "偏移 %d 的 pat_len=%d 与任何模式都对不上", m.offset, m.pat_len)
+    }
+
+    // 表里多出的模式本身无命中 → 结果不受影响（"test" 在 data 里出现两次）
+    long_ctx := Match_Ctx{pattern = s2b("test"), extra = [][]u8{s2b("0123456789abcdef")}}
+    got_long := multi_match(data, long_ctx, &p)
+    defer delete(got_long)
+    testing.expect_value(t, len(got_long), 2) // 只剩 "test"@4
+}
+
+@(test)
+test_matchers_report_scanned_bytes :: proc(t: ^testing.T) {
+    // 契约：算法在返回前调用 progress_add(len(data)) —— 进度条的分子是
+    // 各分片实际扫过的字节数（因重叠窗口会略大于文件大小，这是既有的。
+    // "偶尔超过 100%"的来源）。
+    p: Progress
+    progress_init(&p, 100, false, true) // enabled=true → scanned 才累加
+
+    r1 := single_match(s2b("aaaaa"), Match_Ctx{pattern = s2b("a")}, &p)
+    defer delete(r1)
+    testing.expect_value(t, p.scanned, u64(5))
+
+    r2 := naive_match(s2b("aaaaa"), Match_Ctx{pattern = s2b("aa")}, &p)
+    defer delete(r2)
+    testing.expect_value(t, p.scanned, u64(10))
+
+    r3 := multi_match(s2b("aaaaa"), Match_Ctx{pattern = s2b("a")}, &p)
+    defer delete(r3)
+    testing.expect_value(t, p.scanned, u64(15))
+
+    r4 := single_match(s2b(""), Match_Ctx{pattern = s2b("a")}, &p)
+    defer delete(r4)
+    testing.expect_value(t, p.scanned, u64(15)) // 空数据也上报 0
+
+    // 边界：naive_match 遇空模式**提前返回**，因此不上报字节数（既有行为）。
+    // 该分支不可达于生产（-f 会忽略空行，且 select_matcher(0) 也不会选到
+    // naive 之外的算法），这里只把现状钉住。
+    r5 := naive_match(s2b("aaaaa"), Match_Ctx{pattern = s2b("")}, &p)
+    defer delete(r5)
+    testing.expect_value(t, p.scanned, u64(15))
 }

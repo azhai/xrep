@@ -16,11 +16,46 @@ package main
 // ============================================================================
 
 import "base:runtime"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 
 // 并发往返测试的元素个数（文件作用域常量：嵌套 proc 不构成闭包，无法捕获外层局部量）
 OUT_Q_TEST_N :: 500
+
+// 多生产者压力测试的规模
+OUT_Q_PRODUCERS :: 4
+OUT_Q_PER_PRODUCER :: 250
+// 偏移编码：producer*OUT_Q_STRIDE + 序号，消费侧据此还原来源
+OUT_Q_STRIDE :: 1000
+
+// 每个生产者一份参数副本：idx / per 是自己的；q / remaining / mu 是共享的。
+multi_producer_data :: struct {
+    q:         ^Output_Queue,
+    remaining: ^int, // 尚未结束的生产者数（受 mu 保护）
+    mu:        ^sync.Mutex,
+    idx:       int,
+    per:       int,
+}
+
+// 生产者：顺序推入自己的序号，然后登记退出。
+// **最后一个退出的生产者**负责置 done —— 消费者阻塞在 cond_wait 上，
+// 必须有人唤醒；而 done 又只能在"所有生产者都结束"之后置位（见 output_queue.odin
+// 文件头的并发约定），因此这里需要一把独立的计数锁。
+multi_producer :: proc(data: rawptr) {
+    context = runtime.default_context()
+    ps := cast(^multi_producer_data)data
+    for i in 0..<ps.per {
+        output_queue_push(ps.q, Output_Item{offset = u64(ps.idx * OUT_Q_STRIDE + i)})
+    }
+    sync.mutex_lock(ps.mu)
+    ps.remaining^ -= 1
+    last := ps.remaining^ == 0
+    sync.mutex_unlock(ps.mu)
+    if last {
+        output_queue_set_done(ps.q)
+    }
+}
 
 @(test)
 test_output_queue_fifo_after_done :: proc(t: ^testing.T) {
@@ -116,4 +151,65 @@ test_output_queue_concurrent_roundtrip :: proc(t: ^testing.T) {
     thread.join(th)
     thread.destroy(th)
     testing.expect_value(t, count, OUT_Q_TEST_N)
+}
+
+@(test)
+test_output_queue_multi_producer_complete_and_ordered :: proc(t: ^testing.T) {
+    // 4 个生产者 × 250 条，单消费者。校验两件事：
+    //   1. 总数完整（1000 条一条不少 —— 丢一条就意味着终端输出少一行命中）；
+    //   2. **每个生产者各自的顺序**保持（队列是 FIFO，同一生产者的相邻两次
+    //      push 之间不可能插入它自己的后继）→ 命中明细不会自相交错。
+    // 注意：跨生产者之间的相对顺序不作要求（那本来就是调度决定的）。
+    q: Output_Queue
+    output_queue_init(&q)
+    defer output_queue_destroy(&q)
+
+    mu: sync.Mutex
+    remaining := OUT_Q_PRODUCERS
+    args := make([]multi_producer_data, OUT_Q_PRODUCERS)
+    defer delete(args)
+    threads := make([dynamic]^thread.Thread, 0, OUT_Q_PRODUCERS)
+    defer delete(threads)
+    for w in 0..<OUT_Q_PRODUCERS {
+        args[w] = multi_producer_data{
+            q = &q,
+            remaining = &remaining,
+            mu = &mu,
+            idx = w,
+            per = OUT_Q_PER_PRODUCER,
+        }
+        append(&threads, thread.create_and_start_with_data(&args[w], multi_producer))
+    }
+
+    // 消费侧就在主线程：出队直到 done（由最后一个生产者置位）。
+    last_seq := make([]int, OUT_Q_PRODUCERS)
+    defer delete(last_seq)
+    for w in 0..<OUT_Q_PRODUCERS {
+        last_seq[w] = -1
+    }
+    total := 0
+    for {
+        ok, item := output_queue_pop(&q)
+        if !ok {
+            break
+        }
+        w := int(item.offset / OUT_Q_STRIDE)
+        seq := int(item.offset % OUT_Q_STRIDE)
+        testing.expectf(t, w >= 0 && w < OUT_Q_PRODUCERS, "偏移 %d 解出非法生产者号 %d", item.offset, w)
+        if w < 0 || w >= OUT_Q_PRODUCERS {
+            continue
+        }
+        testing.expectf(t, seq == last_seq[w] + 1, "生产者 %d: 期望序号 %d，实际 %d", w, last_seq[w] + 1, seq)
+        last_seq[w] = seq
+        total += 1
+    }
+    for th in threads {
+        thread.join(th)
+        thread.destroy(th)
+    }
+
+    testing.expect_value(t, total, OUT_Q_PRODUCERS * OUT_Q_PER_PRODUCER)
+    for w in 0..<OUT_Q_PRODUCERS {
+        testing.expectf(t, last_seq[w] == OUT_Q_PER_PRODUCER - 1, "生产者 %d 最后收到序号 %d", w, last_seq[w])
+    }
 }

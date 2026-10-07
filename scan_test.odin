@@ -4,15 +4,23 @@ package main
 // scan_test.odin — 单文件扫描端到端单元测试
 //
 // 覆盖：命中计数、多线程与单线程一致性、跨分片归并后偏移有序、
-//       --after/--before 区间过滤、--limit 语义、dump / dump-prefix 落盘、
-//       --skip-empty / --dump-append / --max-size、空文件快速跳过，
+//       --after/--before 区间过滤、--limit / -m 语义、dump / dump-prefix 落盘、
+//       --skip-empty / --dump-append / --max-size、空文件快速跳过、
+//       多模式端到端、--stats 累加、输出模式判定（legacy_output /
+//       line_index_needed）、分片重叠窗口的重复上报契约，
 //       以及文件不存在时的错误返回。
 //
 // 说明：所有用例以 quiet=true 调用（关闭进度条与统计输出），
 //       使断言聚焦返回值与落盘内容，测试输出保持干净。
 //       临时文件统一使用 /tmp/xrep_ut_* 前缀。
+//
+// 为什么没有"输出文本"断言：输出线程与汇总行都写进程级 stdout，
+// 而 `odin test` 默认并行跑用例 —— 捕获/重定向 fd 1 会与其它用例互相污染，
+// 属于用不可靠的断言换覆盖面。输出文本改由 README「行为验收矩阵」的外部
+// 命令矩阵把关，本文件只断言**返回值、落盘内容、统计累加**这些无歧义的可观察量。
 // ============================================================================
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:testing"
@@ -374,5 +382,311 @@ test_scan_file_multichunk_sorted_merge :: proc(t: ^testing.T) {
         testing.expect(t, err == nil)
         testing.expect_value(t, transmute(string)content, "1000\n1000000\n3000000\n4500000\n")
         delete(content)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 输出模式判定（两个纯函数：决定"走历史偏移输出"与"是否值得建行号表"）
+// ---------------------------------------------------------------------------
+
+@(test)
+test_scan_legacy_output_truth_table :: proc(t: ^testing.T) {
+    // 默认（全零）→ 历史偏移导向输出，进度条可见
+    base := Scan_Options{}
+    testing.expect(t, legacy_output(base), "默认应走传统偏移输出")
+
+    // 任何一个结构化开关都会切走：进度条随之关闭，避免 \r 污染管道
+    o := base; o.show_path = true
+    testing.expect(t, !legacy_output(o), "show_path（多文件/-r）不再是传统输出")
+    o = base; o.line_numbers = true
+    testing.expect(t, !legacy_output(o), "-n 不再是传统输出")
+    o = base; o.only_matching = true
+    testing.expect(t, !legacy_output(o), "-o 不再是传统输出")
+    o = base; o.json = true
+    testing.expect(t, !legacy_output(o), "--json 不再是传统输出")
+    o = base; o.list_mode = .Files_With
+    testing.expect(t, !legacy_output(o), "-l 不再是传统输出")
+    o = base; o.list_mode = .Files_Without
+    testing.expect(t, !legacy_output(o), "-L 不再是传统输出")
+
+    // 注意：quiet 与 only_count **不**参与该判定（既有语义）。
+    // quiet 由 progress_on 单独兜住（scan_region_parallel 里 !quiet && legacy_output），
+    // only_count 走的是"只打印结论行"的早返回分支。
+    o = base; o.quiet = true
+    testing.expect(t, legacy_output(o), "quiet 不改变输出模式判定（由 progress_on 单独处理）")
+    o = base; o.only_count = true
+    testing.expect(t, legacy_output(o), "--count 不改变输出模式判定")
+    // 组合：quiet + 结构化开关仍为 false
+    o = base; o.quiet = true; o.json = true
+    testing.expect(t, !legacy_output(o), "结构化开关优先于 quiet")
+}
+
+@(test)
+test_scan_line_index_needed_truth_table :: proc(t: ^testing.T) {
+    // 纯默认：不建行号表（省掉一次 O(n) 扫描与 O(换行数) 内存）
+    testing.expect(t, !line_index_needed(Scan_Options{}), "默认不需要行号表")
+
+    // 明细要输出行号的三种形态 → 建表
+    o := Scan_Options{line_numbers = true}
+    testing.expect(t, line_index_needed(o), "-n 需要行号表")
+    o = Scan_Options{show_path = true}
+    testing.expect(t, line_index_needed(o), "行导向输出需要行号表")
+    o = Scan_Options{json = true}
+    testing.expect(t, line_index_needed(o), "--json 需要行号表")
+
+    // 明细根本不输出 → 不建表（即便同时打开了开关）
+    o = Scan_Options{line_numbers = true, quiet = true}
+    testing.expect(t, !line_index_needed(o), "quiet 抑制明细，不建行号表")
+    o = Scan_Options{show_path = true, list_mode = .Files_With}
+    testing.expect(t, !line_index_needed(o), "-l 抑制明细，不建行号表")
+    o = Scan_Options{json = true, only_count = true}
+    testing.expect(t, !line_index_needed(o), "--count 抑制明细，不建行号表")
+}
+
+// ---------------------------------------------------------------------------
+// --stats 累加（Run_Stats 的四条计数各自独立）
+// ---------------------------------------------------------------------------
+
+@(test)
+test_scan_file_accumulates_run_stats :: proc(t: ^testing.T) {
+    path :: "/tmp/xrep_ut_scan_stats.bin"
+    scan_write_sample(t, path)
+    defer os.remove(path)
+
+    ctx := Match_Ctx{pattern = s2b("test"), case_insensitive = false}
+    sample_size := u64(len(SCAN_SAMPLE))
+
+    // 1) 有命中：scanned / matched / bytes / hits 全部累加，skipped 不动
+    {
+        st: Run_Stats
+        o := scan_opts(ctx); o.stats = &st
+        hits, _ := scan_file(path, o)
+        testing.expect_value(t, hits, uint(3))
+        testing.expect_value(t, st.files_scanned, uint(1))
+        testing.expect_value(t, st.files_matched, uint(1))
+        testing.expect_value(t, st.files_skipped, uint(0))
+        testing.expect_value(t, st.bytes_scanned, sample_size)
+        testing.expect_value(t, st.total_hits, u64(3))
+    }
+    // 2) 0 命中：仍然算"扫过"，但不算"有命中"
+    {
+        st: Run_Stats
+        o := scan_opts(Match_Ctx{pattern = s2b("zzz-no-such"), case_insensitive = false})
+        o.stats = &st
+        hits, _ := scan_file(path, o)
+        testing.expect_value(t, hits, uint(0))
+        testing.expect_value(t, st.files_scanned, uint(1))
+        testing.expect_value(t, st.files_matched, uint(0))
+        testing.expect_value(t, st.bytes_scanned, sample_size)
+        testing.expect_value(t, st.total_hits, u64(0))
+    }
+    // 3) --max-size 跳过：只加 skipped，其余一律不加（它并非"扫过 0 命中"）
+    {
+        st: Run_Stats
+        o := scan_opts(ctx); o.stats = &st; o.max_size = 10
+        hits, ok := scan_file(path, o)
+        testing.expect_value(t, hits, uint(0))
+        testing.expect(t, ok)
+        testing.expect_value(t, st.files_skipped, uint(1))
+        testing.expect_value(t, st.files_scanned, uint(0))
+        testing.expect_value(t, st.files_matched, uint(0))
+        testing.expect_value(t, st.bytes_scanned, u64(0))
+        testing.expect_value(t, st.total_hits, u64(0))
+    }
+    // 4) 多次扫描是累加而非覆盖
+    {
+        st: Run_Stats
+        o := scan_opts(ctx); o.stats = &st
+        for _ in 0..<3 {
+            _, _ = scan_file(path, o)
+        }
+        testing.expect_value(t, st.files_scanned, uint(3))
+        testing.expect_value(t, st.files_matched, uint(3))
+        testing.expect_value(t, st.bytes_scanned, sample_size * 3)
+        testing.expect_value(t, st.total_hits, u64(9))
+    }
+    // 5) stats == nil（不带 --stats 的默认路径）不得崩溃
+    {
+        o := scan_opts(ctx); o.stats = nil
+        hits, _ := scan_file(path, o)
+        testing.expect_value(t, hits, uint(3))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -m / --max-count：归并结果截断（流式路径由 worker_test.odin 覆盖）
+// ---------------------------------------------------------------------------
+
+@(test)
+test_scan_file_max_count_truncates_results :: proc(t: ^testing.T) {
+    path :: "/tmp/xrep_ut_scan_maxcount.bin"
+    dump :: "/tmp/xrep_ut_scan_maxcount.txt"
+    scan_write_sample(t, path)
+    defer os.remove(path)
+    defer os.remove(dump)
+
+    ctx := Match_Ctx{pattern = s2b("test"), case_insensitive = false}
+
+    // -m 0（默认）= 不限
+    h0, _ := scan_file(path, scan_opts(ctx))
+    testing.expect_value(t, h0, uint(3))
+
+    // -m 2：返回值与落盘都截到 2 条。汇总路径取的是**归并后按偏移升序的前 N 条**
+    // （流式路径取的是"最先算出来的 N 条"，两者在单分片时一致）
+    o := scan_opts(ctx); o.max_count = 2; o.dump_path = dump
+    h1, ok1 := scan_file(path, o)
+    testing.expect_value(t, h1, uint(2))
+    testing.expect(t, ok1)
+    {
+        data, err := os.read_entire_file(dump, context.allocator)
+        testing.expect(t, err == nil)
+        defer delete(data)
+        testing.expect_value(t, transmute(string)data, "6\n17\n")
+    }
+
+    // -m 1：只留偏移最小的一条
+    o2 := scan_opts(ctx); o2.max_count = 1
+    h2, _ := scan_file(path, o2)
+    testing.expect_value(t, h2, uint(1))
+
+    // -m 大于命中数：不补齐，仍是全部 3 条
+    o3 := scan_opts(ctx); o3.max_count = 99
+    h3, _ := scan_file(path, o3)
+    testing.expect_value(t, h3, uint(3))
+
+    // -m 与区间过滤的先后顺序：先按区间过滤，再截断
+    o4 := scan_opts(ctx); o4.max_count = 1; o4.after = 20
+    h4, _ := scan_file(path, o4)
+    testing.expect_value(t, h4, uint(1))
+}
+
+// ---------------------------------------------------------------------------
+// -l / -L 与多模式的端到端契约
+// ---------------------------------------------------------------------------
+
+@(test)
+test_scan_file_list_mode_keeps_count :: proc(t: ^testing.T) {
+    // -l / -L 只是在常规输出之前提前返回（只打文件名），命中数本身不变。
+    path :: "/tmp/xrep_ut_scan_listmode.bin"
+    scan_write_sample(t, path)
+    defer os.remove(path)
+
+    ctx := Match_Ctx{pattern = s2b("test"), case_insensitive = false}
+    plain, _ := scan_file(path, scan_opts(ctx))
+    testing.expect_value(t, plain, uint(3))
+
+    o_l := scan_opts(ctx); o_l.list_mode = .Files_With
+    hl, _ := scan_file(path, o_l)
+    testing.expect_value(t, hl, uint(3))
+
+    // -L 用于有命中的文件时：计数同样是 3（只是不打印该文件）
+    o_L := scan_opts(ctx); o_L.list_mode = .Files_Without
+    hL, _ := scan_file(path, o_L)
+    testing.expect_value(t, hL, uint(3))
+
+    // -l + --json / -L + --json 只影响打印形态，返回值一致
+    o_lj := scan_opts(ctx); o_lj.list_mode = .Files_With; o_lj.json = true
+    hlj, _ := scan_file(path, o_lj)
+    testing.expect_value(t, hlj, uint(3))
+}
+
+@(test)
+test_scan_file_multi_pattern_end_to_end :: proc(t: ^testing.T) {
+    // 多模式（-e / -f）在 worker 里由 select_matcher_for 分派到 multi_match。
+    // SCAN_SAMPLE = "hello test world\ntest again\ntest"（32 字节）：
+    //   "test" @6 / @17 / @28，"world" @11 → 合计 4 条，归并后按偏移升序。
+    path :: "/tmp/xrep_ut_scan_multipat.bin"
+    dump :: "/tmp/xrep_ut_scan_multipat.txt"
+    scan_write_sample(t, path)
+    defer os.remove(path)
+    defer os.remove(dump)
+
+    ctx := Match_Ctx{
+        pattern = s2b("test"),
+        extra = [][]u8{s2b("world")},
+    }
+    thread_counts := []uint{1, 4}
+    for n in thread_counts {
+        o := scan_opts(ctx, n); o.dump_path = dump
+        hits, ok := scan_file(path, o)
+        testing.expectf(t, hits == 4, "threads=%d 多模式应命中 4 条，实际 %d", n, hits)
+        testing.expect(t, ok)
+        data, err := os.read_entire_file(dump, context.allocator)
+        testing.expect(t, err == nil)
+        defer delete(data)
+        testing.expect_value(t, transmute(string)data, "6\n11\n17\n28\n")
+    }
+
+    // 大小写不敏感同样贯穿多模式路径
+    ctx_i := Match_Ctx{
+        pattern = s2b("TEST"),
+        extra = [][]u8{s2b("World")},
+        case_insensitive = true,
+    }
+    hi, _ := scan_file(path, scan_opts(ctx_i, 2))
+    testing.expect_value(t, hi, uint(4))
+
+    // --after 过滤作用在**绝对偏移**上（多模式命中同样被过滤）
+    o_f := scan_opts(ctx, 2); o_f.after = 13
+    hf, _ := scan_file(path, o_f)
+    testing.expect_value(t, hf, uint(2)) // 只剩 17 与 28
+}
+
+// ---------------------------------------------------------------------------
+// 分片重叠窗口的契约（README 已知行为#2）
+// ---------------------------------------------------------------------------
+
+@(test)
+test_scan_chunk_overlap_contract :: proc(t: ^testing.T) {
+    // 每个任务向后多扫 CHUNK_OVERLAP 字节，以免切断跨分片的匹配；
+    // 代价是完全落在 [分片边界, 边界+CHUNK_OVERLAP) 的命中会被相邻两个任务
+    // 各报一次（不去重）。本用例把三个位置逐一钉死：
+    //   b-1   跨界命中            → 只有前一个任务看得到（重叠窗口存在的理由）
+    //   b     恰在边界            → 两个任务都看得到 → 报 2 次（已知契约）
+    //   b+16  边界 + 重叠长度     → 刚好在窗口之外 → 只报 1 次
+    b := uint(TASK_CHUNK_SIZE)
+    tail := uint(1024)
+    ctx := Match_Ctx{pattern = s2b("test"), case_insensitive = false}
+
+    // ---- 跨界命中不被切断 ----
+    path_a :: "/tmp/xrep_ut_scan_ovl_straddle.bin"
+    {
+        data_a := make([]u8, int(b + tail))
+        defer delete(data_a)
+        for i in 0..<len(data_a) {
+            data_a[i] = 'z'
+        }
+        copy(data_a[b - 1:b + 3], s2b("test"))
+        testing.expect(t, os.write_entire_file(path_a, data_a) == nil)
+    }
+    defer os.remove(path_a)
+    hits_a, _ := scan_file(path_a, scan_opts(ctx, 4))
+    testing.expect_value(t, hits_a, uint(1))
+
+    // ---- 重叠窗口内的重复上报 + 窗口外的单次上报 ----
+    path_b :: "/tmp/xrep_ut_scan_ovl_dup.bin"
+    dump :: "/tmp/xrep_ut_scan_ovl_dup.txt"
+    defer os.remove(path_b)
+    defer os.remove(dump)
+    {
+        data_b := make([]u8, int(b + tail))
+        defer delete(data_b)
+        for i in 0..<len(data_b) {
+            data_b[i] = 'z'
+        }
+        copy(data_b[b:b + 4], s2b("test"))
+        copy(data_b[b + CHUNK_OVERLAP:], s2b("test"))
+        testing.expect(t, os.write_entire_file(path_b, data_b) == nil)
+    }
+    o := scan_opts(ctx, 4); o.dump_path = dump
+    hits_b, _ := scan_file(path_b, o)
+    testing.expect_value(t, hits_b, uint(3))
+    {
+        content, err := os.read_entire_file(dump, context.allocator)
+        testing.expect(t, err == nil)
+        defer delete(content)
+        want := fmt.aprintf("%d\n%d\n%d\n", b, b, b + CHUNK_OVERLAP)
+        defer delete(want)
+        testing.expect_value(t, transmute(string)content, want)
     }
 }

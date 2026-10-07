@@ -84,7 +84,7 @@ OUT=xrep2 ./build.sh    # 自定义输出名
 | `--skip-empty` | 命中 0 条时不产出 dump 文件（默认会产出空文件） |
 | `--no-color` | 已接受但**无效果**（见"已知行为"；请用 `--color never`） |
 | `--test` | 运行随二进制分发的内建自检 |
-| `--bench` | 运行匹配算法微基准（100 MiB 合成数据） |
+| `--bench` | 运行微基准：A 组匹配算法吞吐（模式长度 / 大小写 / 多模式），B 组端到端并行扫描的 1/2/4/8 线程伸缩 |
 | `-v`, `--version` | 打印版本并立即退出（其后的参数不再解析） |
 | `-h`, `--help` | 打印帮助并立即退出（其后的参数不再解析） |
 
@@ -132,27 +132,36 @@ OUT=xrep2 ./build.sh    # 自定义输出名
 | `io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加）、**`build_line_index`/`line_of`、`json_escape`、`print_hex_bytes`、`resolve_color`** |
 | `scan.odin` | `Scan_Options` + `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**） |
 | `selftest.odin` | 内建自检 `run_tests`（`--test`），随二进制分发 |
-| `bench.odin` | 微基准 `run_bench`（`--bench`） |
+| `bench.odin` | 微基准 `run_bench`（`--bench`）：A 组算法吞吐 + B 组端到端线程伸缩 |
 
 > `arena_pool.odin` 已在 ADR 0004 中删除（arena 定长，无法承载无界的命中结果集）。
 
-### 测试代码（11 个文件，105 个用例）
+### 测试代码（12 个文件，129 个用例）
 
 | 测试文件 | 覆盖目标 | 用例数 |
 | --- | --- | --- |
 | `io_utils_test.odin` | `context_range` 全部边界、文件读取成功/失败、`file_size_of`、`sanitize_dump_name`（绝对/相对/Windows 保留字符/UTF-8/空串）、dump 各形态、**行号表与 `line_of` 二分、`json_escape`、`hex_digit`、`resolve_color`、`print_hex_bytes` 边界** | 21 |
 | `cli_test.odin` | 参数解析：默认值、位置参数分配、全部长短标志、**`--k=v` 等号形式、短标志捆绑、多模式、`-f`、`--color`、遍历/输出开关**、错误分支、`--help`/`--version` 即时性 | 24 |
-| `scan_test.odin` | 端到端扫描：计数、线程数一致性、区间过滤、`--limit` 契约语义、dump 与 dump-prefix 清洗、`--dump-append`/`--skip-empty`/`--max-size`/空文件快速跳过/落盘失败上报、跨分片归并有序、文件缺失、**`-l/-L`/`-m`/`--json`** | 14 |
-| `matcher_test.odin` | 算法选择表边界（1/2/16/17/64/65/0、区间外回退）、重叠命中、大小写、空模式、NUL 字节、算法间一致性、**多模式 `multi_match` 与 `select_matcher_for` 分派、稠密命中不被截断（ADR 0004 回归）** | 10 |
-| `walk_test.odin` | glob 语义（`*` 不跨 `/`、`**` 跨 `/`、`?`、转义、basename 规则）、递归/非递归、隐藏文件、exclude、按后缀过滤 | 11 |
+| `scan_test.odin` | 端到端扫描：计数、线程数一致性、区间过滤、`--limit` 契约语义、dump 与 dump-prefix 清洗、`--dump-append`/`--skip-empty`/`--max-size`/空文件快速跳过/落盘失败上报、跨分片归并有序、文件缺失、`-l/-L`、`-m` 截断、多模式端到端、**`Run_Stats` 四条计数各自的累加规则**、`legacy_output` / `line_index_needed` 真值表、**分片重叠窗口的重复上报契约** | 21 |
+| `matcher_test.odin` | 算法选择表边界（1/2/16/17/64/65/0、区间外回退）、重叠命中、大小写、空模式、NUL 字节、算法间一致性、多模式 `multi_match` 与 `select_matcher_for` 分派、稠密命中不被截断（ADR 0004 回归）、**差分测试（8 种模式 × 大小写两态 × 三条实现路径，对照 `core:strings` 参考实现）**、**多模式 = 单模式多重集并集**、**各算法向 `Progress` 上报的字节数** | 13 |
+| `walk_test.odin` | glob 语义（`*` 不跨 `/`、`**` 跨 `/`、`?`、转义、basename 规则）、递归/非递归、隐藏文件、exclude、按后缀过滤、空输入、**不可读目录的容错**、**`strip_dot_slash`/`join_path`/`walk_hidden`/`walk_excluded`/`walk_glob_ok` 纯函数** | 16 |
 | `progress_test.odin` | 初始化字段、禁用时不累加 `scanned`、启用时累加与限流、`total=0` 渲染短路 | 5 |
 | `slice_utils_test.odin` | map/fold/filter/take/drop/sort 的空切片、n=0、n=len、n>len、重复键等边界 | 5 |
-| `common_test.odin` | `lower_table` 填充规则（含非字母透传）、`s2b` 零拷贝、`clamp_thread_count` 边界、常量不变量 | 4 |
-| `merge_test.odin` | 空列表集合、单列表、三路交错、空条目、重复偏移、总长度不变量 | 4 |
-| `output_queue_test.odin` | FIFO、`done` 后立即返回、重复 `set_done`、单生产者/单消费者并发往返 | 4 |
-| `task_pool_test.odin` | 空池出队、LIFO 顺序、取空后可复用 | 3 |
+| `common_test.odin` | `lower_table` 填充规则（含非字母透传）、`s2b` 零拷贝、`clamp_thread_count` 边界、常量不变量、**`ctx_pattern_count`/`ctx_pattern_at` 模式表访问器** | 5 |
+| `merge_test.odin` | 空列表集合、单列表、三路交错、空条目、重复偏移、总长度不变量、**8 路随机分片的多重集与升序校验**、**全同偏移的极限形态** | 6 |
+| `output_queue_test.odin` | FIFO、`done` 后立即返回、重复 `set_done`、单生产者/单消费者并发往返、**4 生产者 × 250 条的总数与每生产者 FIFO 校验** | 5 |
+| `task_pool_test.odin` | 空池出队、LIFO 顺序、取空后可复用、**4 线程抢 200 任务：每个任务恰好被弹出一次** | 4 |
+| `worker_test.odin` | **命中偏移从分片相对改写为文件绝对**（`--after/--before`/`--dump`/行号都依赖它）、多任务产出多分片列表、空任务池立即退出、多模式分派确实走 `multi_match`、**输出线程的 `-m` 计数契约与 done 退出** | 4 |
 
-> 用例数合计 105；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
+> 用例数合计 129；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
+
+### 关于"没有输出文本断言"
+
+输出线程与汇总行都写**进程级 stdout**，而 `odin test` 默认**并行**跑用例 ——
+捕获或重定向 fd 1 会与其它用例互相污染，属于用不可靠的断言换覆盖面。
+因此 `*_test.odin` 只断言**返回值、落盘文件内容、统计累加、队列与偏移**这些
+无歧义的可观察量；输出文本（`match offset:` / `path:line:offset` / JSON 字段 /
+颜色码）由下节的外部命令矩阵把关。
 
 
 ## 测试
@@ -178,11 +187,46 @@ ODIN_CC=/usr/bin/clang odin test . -linker:lld -define:ODIN_TEST_THREADS=1   # �
 其它入口：
 
 ```bash
-./xrep --test             # 进程内自检（核心工具函数 + 朴素匹配冒烟）
-./xrep --bench            # 匹配算法吞吐量对比
+./xrep --test             # 进程内自检（slice 工具 + 匹配 + 归并 + glob + JSON 转义 + 清洗）
+./xrep --bench            # 微基准（耗时约 7s，见下节）
 ```
 
-### 基线：105 用例全绿、0 内存泄漏
+### 微基准（`--bench`，约 7s）
+
+两组测量，全部在内存里的合成数据上跑，不落盘：
+
+- **A 组 · 匹配算法吞吐**（100 MiB 周期数据，每档 5 轮取**最快一轮**）：
+  按模式长度分档 1B / 2B / 4B / 16B / 17B / 64B / 128B —— 正好覆盖 `alg_table`
+  的每一档与表外回退；再加 `-i`（大小写不敏感）与 2/4 模式（`multi_match`）。
+  每个 case 都经 `select_matcher_for` 分派，因此打印的算法名就是实际执行的那个，
+  顺带验证了长度分派。
+- **B 组 · 端到端线程伸缩**（64 MiB 稀疏数据，每档 3 轮取最快一轮）：
+  直接跑 `scan_region_parallel` —— 任务池 + worker + 输出队列 + 归并的完整路径，
+  报告 1/2/4/8 线程的吞吐与相对加速比。单看 A 组只说明"算法有多快"，
+  B 组才说明"多线程有没有用"。
+
+本机（10 逻辑核）实测输出示例：
+
+```
+-- A1. single pattern, case sensitive --
+  1B       single_match    1738.28 MB/s
+  4B       bndm_match      1484.14 MB/s
+ 17B      naive_match     1362.71 MB/s
+128B      naive_match      956.05 MB/s
+-- A3. multi pattern (-e / -f) --
+  2 pat    multi_match      435.07 MB/s
+  4 pat    multi_match      219.87 MB/s
+-- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / 65536 B) --
+  1 thread(s)         1276.60 MB/s   1.00x
+  8 thread(s)         7600.05 MB/s   5.95x
+```
+
+口径说明：B 组用**稀疏**数据（每 64 KiB 一处命中）是有意的 —— 出队是
+O(队列长度) 的整体左移，密集命中会让输出队列而不是扫描主导吞吐，
+那是另一个话题。A 组取"最快一轮"是因为别的负载与调度抖动只会让结果变慢，
+不会让它变快。
+
+### 基线：129 用例全绿、0 内存泄漏
 
 内存追踪**保持开启**（`test.sh` 不再传 `ODIN_TEST_TRACK_MEMORY=false`）。
 基线就是"全绿且没有任何 `+++ leak` 告警"——因此**看到 leak 就是真问题**，
@@ -194,6 +238,16 @@ ODIN_CC=/usr/bin/clang odin test . -linker:lld -define:ODIN_TEST_THREADS=1   # �
   `multi_match` 的返回值**都由调用方 `delete`；`os.stat` 返回的 `File_Info`
   需 `file_info_delete`。只判存在性时用 `os.exists(path)`，它不分配。
 - 自建线程的入口必须先 `context = runtime.default_context()`（见下节）。
+- **worker 线程产出的东西，内外两层都要用默认分配器释放**：
+  命中数组是 matcher 在 worker 线程里分配的，而分片列表的 dynamic 数组是被
+  worker 的 `append` **首次扩容**出来的 —— 那里 context 已是 default_context，
+  所以外层也在默认堆上。两层都用 `delete(x, runtime.default_context().allocator)`，
+  否则主线程的追踪分配器会去 free 堆指针，报 `+++ bad free`（见
+  `worker_test.odin` 的 `free_match_lists`）。
+- **`defer` 是块作用域**：`if` / `for` 体内的 `defer` 会在该块结束时立即执行。
+  凡是"离开该块后还要用"的值（例如作为参考数据的 `strings.to_lower` 结果），
+  `defer` 必须写在函数体顶层，或改用显式 `delete` 收尾 —— 提前 free 会让断言
+  读到已释放内存，表现为"参考实现莫名其妙少报一半命中"。
 - 测试构造字符串请用 `fmt.aprintf` 而非 `fmt.tprintf`：后者来自临时分配器，
   再手工 `delete` 会变成"释放了不该释放的指针"。
 
@@ -213,8 +267,10 @@ ODIN_CC=/usr/bin/clang odin test . -linker:lld -define:ODIN_TEST_THREADS=1   # �
 
 ### 关于测试输出的噪声（均为预期行为，非失败）
 
-- 错误路径用例（文件不存在、dump 目录不可达、`--max-size` 跳过）会向 stderr
-  打印预期内的信息；`print_context` 冒烟用例会向 stdout 打印几行 hex。
+- 错误路径用例（文件不存在、dump 目录不可达、`--max-size` 跳过、**目录不可读**）
+  会向 stderr 打印预期内的信息；`print_context` 冒烟用例会向 stdout 打印几行 hex。
+- **`-l` / `-L` / `--json` 的输出用例会向 stdout 打印文件名或 JSON 行**：这两个开关
+  只抑制明细，汇总/结论行照打（既有语义），因此用例里的 `quiet=true` 并不能完全静默。
 - 测试文件（`*_test.odin`）在当前 Odin 版本下会一并被 `odin build .` 编译
   （但 `@(test)` 不会被调用，不影响运行行为），因此测试代码必须始终可编译。
 

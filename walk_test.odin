@@ -5,13 +5,17 @@ package main
 //
 // 覆盖：
 //   * glob_match：basename 规则、`*` 不跨 `/`、`**` 跨 `/`、`?`、反斜杠转义；
-//   * walk_expand：递归展开、非递归目录被拒、隐藏项、--glob 过滤、--exclude 排除。
+//   * walk 的纯辅助函数：strip_dot_slash / join_path / walk_hidden /
+//     walk_excluded / walk_glob_ok；
+//   * walk_expand：递归展开、非递归目录被拒、隐藏项、--glob 过滤、--exclude 排除、
+//     空输入、不可读目录的容错。
 //
-// 两个必须注意的点：
+// 三个必须注意的点：
 //   1. 测试运行器默认**并行**跑用例，因此每个用例必须使用**独立的根目录**，
 //      否则会互相删树（第一次写这组用例时就踩到了）。
 //   2. `fmt.tprintf` 走临时分配器，其返回值**不能 delete**（会报 bad free）；
 //      需要释放的字符串一律用 `fmt.aprintf`。
+//   3. 新起线程的入口必须先 `context = runtime.default_context()`（见 worker.odin）。
 // ============================================================================
 
 import "core:fmt"
@@ -206,4 +210,89 @@ test_walk_passthrough_non_dir_kept_verbatim :: proc(t: ^testing.T) {
     defer walk_free(&files)
     testing.expect_value(t, len(files), 1)
     testing.expect_value(t, files[0], missing)
+}
+
+@(test)
+test_walk_expand_empty_and_unreadable_dir :: proc(t: ^testing.T) {
+    // 空输入 → 空结果（walk_free 对空动态数组安全）
+    empty := walk_expand([]string{}, Walk_Options{recursive = true})
+    testing.expect_value(t, len(empty), 0)
+    walk_free(&empty)
+
+    // 目录不存在 / 不可读：报 stderr 后**静默跳过**，不崩溃、不产出条目。
+    // （这是"部分遍历失败也要把已收集结果交付"的容错路径。）
+    out: [dynamic]string
+    defer {
+        walk_free(&out)
+    }
+    walk_dir("/tmp/xrep_ut_walk_no_such_dir_7c1e", Walk_Options{recursive = true}, &out)
+    testing.expect_value(t, len(out), 0)
+}
+
+// ---------------------------------------------------------------------------
+// 纯辅助函数（无需建树即可断言的路径算术与过滤判定）
+// ---------------------------------------------------------------------------
+
+@(test)
+test_strip_dot_slash :: proc(t: ^testing.T) {
+    // 目的是让 './src/x.bin' 能与模式 'src/*.bin' 比较；只剥**开头**的 './'。
+    testing.expect_value(t, strip_dot_slash("./src/x.bin"), "src/x.bin")
+    testing.expect_value(t, strip_dot_slash("././src/x.bin"), "src/x.bin")
+    testing.expect_value(t, strip_dot_slash("src/x.bin"), "src/x.bin")
+    testing.expect_value(t, strip_dot_slash("/abs/src/x.bin"), "/abs/src/x.bin")
+    // 中间的 "./" 不处理；单独的 "." 与 "./" 剥成空串
+    testing.expect_value(t, strip_dot_slash("src/./x.bin"), "src/./x.bin")
+    testing.expect_value(t, strip_dot_slash("./"), "")
+    testing.expect_value(t, strip_dot_slash("."), ".")
+    testing.expect_value(t, strip_dot_slash(""), "")
+}
+
+@(test)
+test_join_path :: proc(t: ^testing.T) {
+    a := join_path("/tmp/dir", "f.bin")
+    testing.expect_value(t, a, "/tmp/dir/f.bin")
+    defer delete(a)
+
+    // 目录已以 '/' 结尾时直接相接，绝不产生 '//'
+    b := join_path("/tmp/dir/", "f.bin")
+    testing.expect_value(t, b, "/tmp/dir/f.bin")
+    defer delete(b)
+
+    // 空目录 → 前导斜杠（与 os 行为一致；walk_dir 不会这样调，但纯函数需自洽）
+    c := join_path("", "f.bin")
+    testing.expect_value(t, c, "/f.bin")
+    defer delete(c)
+}
+
+@(test)
+test_walk_hidden_predicate :: proc(t: ^testing.T) {
+    // 默认：'.' 开头一律隐藏（含 "." 与 ".."）
+    testing.expect(t, walk_hidden(".git", false), ". 开头视为隐藏")
+    testing.expect(t, walk_hidden(".", false), "\".\" 视为隐藏")
+    testing.expect(t, walk_hidden("..", false), "\"..\" 视为隐藏")
+    testing.expect(t, !walk_hidden("a.txt", false), "普通文件名不算隐藏")
+    testing.expect(t, !walk_hidden("", false), "空名不算隐藏")
+    testing.expect(t, walk_hidden("..weird", false), "以 '.' 开头即隐藏（不判断它是否真是父目录项）")
+    // --hidden：全部收录
+    testing.expect(t, !walk_hidden(".git", true), "--hidden 下不再隐藏")
+    testing.expect(t, !walk_hidden("..", true), "--hidden 下 \"..\" 也收录")
+}
+
+@(test)
+test_walk_filter_predicates :: proc(t: ^testing.T) {
+    // walk_glob_ok：globs 为空 → 全收；非空 → 至少命中一条
+    all := Walk_Options{}
+    testing.expect(t, walk_glob_ok("a/b.txt", all), "无 glob 时全收")
+    testing.expect(t, !walk_excluded("a/b.txt", all), "无 exclude 时不排除")
+
+    g := Walk_Options{globs = []string{"*.bin", "*.txt"}}
+    testing.expect(t, walk_glob_ok("a/b.txt", g), "命中第二条 glob")
+    testing.expect(t, walk_glob_ok("deep/x.bin", g), "命中第一条 glob（basename 规则）")
+    testing.expect(t, !walk_glob_ok("deep/x.dat", g), "都不命中则排除")
+
+    // walk_excluded：任一条命中即排除
+    e := Walk_Options{excludes = []string{"*.log", "vendor"}}
+    testing.expect(t, walk_excluded("a/b.log", e), "按扩展名排除")
+    testing.expect(t, walk_excluded("vendor", e), "按目录名排除")
+    testing.expect(t, !walk_excluded("a/b.txt", e), "未命中任何 exclude")
 }

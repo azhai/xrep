@@ -78,6 +78,36 @@ test_clamp_thread_count :: proc(t: ^testing.T) {
     testing.expect_value(t, clamp_thread_count(FALLBACK_MAX_THREADS + 1, 0), uint(FALLBACK_MAX_THREADS))
 }
 
+// ---------------------------------------------------------------------------
+// 模式表访问器（multi_match 的取模式入口）
+// ---------------------------------------------------------------------------
+
+@(test)
+test_ctx_pattern_accessors :: proc(t: ^testing.T) {
+    // 单模式：主模式独占 0 号槽位，模式表长度为 1
+    single := Match_Ctx{pattern = s2b("ab")}
+    testing.expect_value(t, ctx_pattern_count(single), 1)
+    testing.expect_value(t, string(ctx_pattern_at(single, 0)), "ab")
+
+    // 多模式：索引 0 恒为主模式，其余按 extra 顺序排列
+    multi := Match_Ctx{pattern = s2b("ab"), extra = [][]u8{s2b("cd"), s2b("ef")}}
+    testing.expect_value(t, ctx_pattern_count(multi), 3)
+    testing.expect_value(t, string(ctx_pattern_at(multi, 0)), "ab")
+    testing.expect_value(t, string(ctx_pattern_at(multi, 1)), "cd")
+    testing.expect_value(t, string(ctx_pattern_at(multi, 2)), "ef")
+
+    // 边界：extra 为空切片（而非 nil）时长度仍是 1 —— -f 读到空文件就会是这种形状
+    empty_extra := Match_Ctx{pattern = s2b("z"), extra = [][]u8{}}
+    testing.expect_value(t, ctx_pattern_count(empty_extra), 1)
+
+    // 空模式**仍然占槽**：由 multi_match 负责跳过（见 matcher.odin），
+    // 这里锁住"占槽"这一事实，避免有人改成过滤后改变模式编号语义。
+    blanks := Match_Ctx{pattern = s2b(""), extra = [][]u8{s2b("")}}
+    testing.expect_value(t, ctx_pattern_count(blanks), 2)
+    testing.expect_value(t, len(ctx_pattern_at(blanks, 0)), 0)
+    testing.expect_value(t, len(ctx_pattern_at(blanks, 1)), 0)
+}
+
 @(test)
 test_runtime_constants_sane :: proc(t: ^testing.T) {
     // 常量抽取后仍需满足基本不变量，避免误调

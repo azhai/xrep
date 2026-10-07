@@ -3,9 +3,12 @@ package main
 // ============================================================================
 // selftest.odin — 内建自测（`xrep --test`）
 //
-// 职责：进程内冒烟自测，随二进制一起分发，用于部署后快速确认核心工具函数与
-//       朴素匹配可用。**不是**完整的单元测试套件 —— 完整套件见 `*_test.odin`
-//       与 `./test.sh`（`odin test` 驱动）。
+// 职责：进程内冒烟自测，随二进制一起分发，用于部署后快速确认核心工具函数、
+//       匹配算法与输出辅助函数可用。**不是**完整的单元测试套件 —— 完整套件见
+//       `*_test.odin` 与 `./test.sh`（`odin test` 驱动）。
+//
+// 覆盖项：slice 工具族、朴素匹配、多模式匹配、多路归并、glob 匹配、
+//       JSON 字符串转义、dump 文件名清洗。
 //
 // 依赖：core:fmt、core:mem、core:slice。
 // 注意：文件名刻意不采用 `_test.odin` 后缀，以免被测试构建模式特殊处理。
@@ -88,6 +91,80 @@ run_tests :: proc() -> bool {
             ok = false
         } else {
             fmt.println("OK naive_match")
+        }
+    }
+    {
+        // 多模式冒烟：主模式 "test" 命中 2 处（@4 / @13），额外模式 "foo" 命中 2 处
+        // （@0 / @17），合计 4 条。
+        ctx := Match_Ctx{pattern = s2b("test"), extra = [][]u8{s2b("foo")}}
+        data := s2b("foo test bar testfoo")
+        p: Progress
+        progress_init(&p, 0, false, false)
+        matches := multi_match(data, ctx, &p)
+        defer delete(matches)
+        // 语义：结果按"偏移升序、同偏移再按模式表顺序"产出，不做去重。
+        pass := len(matches) == 4 && matches[0].offset == 0 && matches[3].offset == 17
+        if !pass {
+            fmt.println("FAIL multi_match")
+            ok = false
+        } else {
+            fmt.println("OK multi_match")
+        }
+    }
+    {
+        // 多路归并冒烟：两个乱序分片合并后必须全局升序且一条不少。
+        a := []Match_Result{{offset = 30}, {offset = 40}}
+        b := []Match_Result{{offset = 10}, {offset = 50}}
+        merged := merge_ordered_matches([][]Match_Result{a, b})
+        defer delete(merged)
+        pass :=
+            len(merged) == 4 &&
+            merged[0].offset == 10 &&
+            merged[1].offset == 30 &&
+            merged[2].offset == 40 &&
+            merged[3].offset == 50
+        if !pass {
+            fmt.println("FAIL merge_ordered_matches")
+            ok = false
+        } else {
+            fmt.println("OK merge_ordered_matches")
+        }
+    }
+    {
+        // glob 冒烟：`*` 不跨 `/`，`**` 跨 `/`；无 `/` 的模式只比 basename。
+        pass :=
+            glob_match("*.bin", "deep/dir/a.bin") &&
+            glob_match("src/*", "src/a.c") &&
+            !glob_match("src/*", "src/sub/a.c") &&
+            glob_match("src/**", "src/sub/a.c") &&
+            !glob_match("*.bin", "a.txt")
+        if !pass {
+            fmt.println("FAIL glob_match")
+            ok = false
+        } else {
+            fmt.println("OK glob_match")
+        }
+    }
+    {
+        // JSON 转义冒烟：引号 / 反斜杠 / 换行 / 控制字符。
+        esc := json_escape("a\"b\\c\nd\x01")
+        defer delete(esc)
+        if esc != "a\\\"b\\\\c\\nd\\u0001" {
+            fmt.println("FAIL json_escape")
+            ok = false
+        } else {
+            fmt.println("OK json_escape")
+        }
+    }
+    {
+        // dump 文件名清洗冒烟：路径分隔符与 Windows 保留字符 → '_'，长度不变。
+        safe := sanitize_dump_name("./a:b*c.bin")
+        defer delete(safe)
+        if string(safe) != "._a_b_c.bin" {
+            fmt.println("FAIL sanitize_dump_name")
+            ok = false
+        } else {
+            fmt.println("OK sanitize_dump_name")
         }
     }
     if ok {
