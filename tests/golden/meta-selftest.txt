@@ -1,0 +1,21 @@
+=== cmd ===
+xrep --test
+=== exit ===
+0
+=== stdout ===
+=== Running Unit Tests ===
+OK slice_map
+OK slice_fold
+OK slice_filter
+OK take/drop
+OK slice_sort
+OK naive_match
+OK multi_match
+OK merge_ordered_matches
+OK glob_match
+OK json_escape
+OK sanitize_dump_name
+=== All tests passed ===
+
+=== stderr ===
+=== files ===

@@ -1,0 +1,17 @@
+=== cmd ===
+xrep -r --json --dump-prefix @OUT@/p_ test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+{"file":"tests/fixtures/dir/a.txt","line":1,"offset":0,"len":4}
+{"file":"tests/fixtures/dir/b.bin","line":1,"offset":0,"len":4}
+{"file":"tests/fixtures/dir/sub/c.txt","line":1,"offset":0,"len":4}
+=== stderr ===
+=== files ===
+--- p_tests_fixtures_dir_a.txt.txt ---
+0
+--- p_tests_fixtures_dir_b.bin.txt ---
+0
+--- p_tests_fixtures_dir_sub_c.txt.txt ---
+0
+--- p_tests_fixtures_dir_sub_deep_d.bin.txt ---

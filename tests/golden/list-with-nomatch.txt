@@ -1,0 +1,7 @@
+=== cmd ===
+xrep -l zzz-nope tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+=== stderr ===
+=== files ===

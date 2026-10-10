@@ -1,0 +1,12 @@
+=== cmd ===
+xrep -c --dump @OUT@/d.txt test @SETUP@/chunk_dup.bin
+=== exit ===
+0
+=== stdout ===
+[32;1m[########################################][0m 100.00% 2098192/2098176 bytes
+@SETUP@/chunk_dup.bin: 2 hits
+=== stderr ===
+=== files ===
+--- d.txt ---
+2097152
+2097152

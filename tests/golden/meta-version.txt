@@ -1,0 +1,8 @@
+=== cmd ===
+xrep --version
+=== exit ===
+0
+=== stdout ===
+xrep 0.3.0
+=== stderr ===
+=== files ===

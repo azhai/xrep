@@ -167,7 +167,8 @@ OUT=xrep2 ./build.sh    # 自定义输出名
 ## 测试
 
 ```bash
-./test.sh                 # 推荐：单元测试（含内存泄漏检查）+ 内建自检，一条命令跑完
+./test.sh                 # 单元测试（含内存泄漏检查）+ 内建自检，一条命令跑完
+./verify.sh               # 完整验收：上面这些 + 三套行为验收矩阵（见下节）
 ```
 
 等价的手工命令（注意与 `build.sh` 相同链接器修正）：
@@ -189,6 +190,7 @@ ODIN_CC=/usr/bin/clang odin test . -linker:lld -define:ODIN_TEST_THREADS=1   # �
 ```bash
 ./xrep --test             # 进程内自检（slice 工具 + 匹配 + 归并 + glob + JSON 转义 + 清洗）
 ./xrep --bench            # 微基准（耗时约 7s，见下节）
+tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update / TESTS_FILTER）
 ```
 
 ### 微基准（`--bench`，约 7s）
@@ -251,19 +253,47 @@ O(队列长度) 的整体左移，密集命中会让输出队列而不是扫描�
 - 测试构造字符串请用 `fmt.aprintf` 而非 `fmt.tprintf`：后者来自临时分配器，
   再手工 `delete` 会变成"释放了不该释放的指针"。
 
-### 行为验收矩阵（非单元测试）
+### 行为验收矩阵（非单元测试，仓库内 `tests/`）
 
-`odin test` 覆盖函数级行为；**对外可观察行为**另外用三套命令矩阵把关
-（都在 `/tmp/xrep_verify/`，按需重建）：
+`odin test` 覆盖函数级行为；**对外可观察行为**另外用三套命令矩阵把关。
+它们原先只存在于 `/tmp/xrep_verify/`（临时目录，现已消失），**已重建到仓库里**：
 
-| 矩阵 | 内容 | 通过标准 |
+```bash
+./verify.sh              # 一条命令跑完：单元测试 + 内建自检 + 三套矩阵
+./verify.sh --update     # 重新生成 golden（**仅在有意改行为时**）
+TESTS_FILTER=dump ./verify.sh   # 只跑名字含 dump 的命令
+```
+
+| 脚本 | 内容 | 规模 |
 | --- | --- | --- |
-| `run.sh <bin> <outdir>` | 47 条"历史命令"（全部旧标志组合、错误路径、多线程、dump、`--test`/`--help`），每条采集 stdout/stderr/退出码 | 与 HEAD 产物 `diff -r` **只允许出现 help/usage 文本差** |
-| `run2.sh <bin>` | ADR 0002 那批新增/变更行为的断言（版本、线程夹取、dump-prefix 清洗、dump 失败退出码、skip-empty、dump-append、max-size、多文件汇总、空文件） | 27 PASS / 0 FAIL |
-| `run3.sh <bin>` | krep 对齐功能的断言（`-r`、glob/exclude/hidden、`-l/-L`、`-n`、`-o`、`-m`、`-e/-f`、`--json`、`--stats`、`--color`、短标志捆绑、单文件默认输出回归护栏） | 43 PASS / 0 FAIL |
+| `tests/run.sh <bin> [outdir]` | 历史命令 **golden 矩阵**：全部旧标志组合、错误路径、多线程、dump、`--test`/`--help`、分片重叠窗口契约。每条采集 stdout / stderr / 退出码 / **它产出的所有文件**，与 `tests/golden/<name>.txt` 逐字节比对 | 77 条命令 |
+| `tests/run2.sh <bin>` | ADR 0002 那批新增/变更行为的**断言**（版本、线程夹取、dump-prefix 清洗、dump 失败退出码、skip-empty、dump-append、max-size、多文件汇总、空文件、参数互斥） | 34 条断言 |
+| `tests/run3.sh <bin>` | krep 对齐功能的**断言**（`-r`、glob/exclude/hidden、`-l/-L`、`-n`、`-o`、`-m`、`-e/-f`、`--json`、`--stats`、`--color`、短标志捆绑、单文件默认输出回归护栏） | 56 条断言 |
+| `tests/lib.sh` | run2/run3 共用的断言小工具（`eq`/`has`/`hasnt`/`file_eq`/`exists`/`missing`/`run`） | — |
+| `tests/fixtures/` | 矩阵用的固定输入（文本、空文件、目录树含隐藏项、`-f` 模式文件） | — |
 
-**改动行为的纪律**：等价重构 → 矩阵 `diff` 必须为空；有意改行为 → `diff` 必须
-**只含预期文件**（如 help 文本），其余逐条解释，并另外单独核对 dump 内容与退出码。
+**两套机制的分工**：`run.sh` 是"逐字节快照"（golden 不知道对错，只报**变化**）；
+`run2.sh`/`run3.sh` 每条都有明确对错，行为被无意改坏时**直接指名道姓**。
+
+**改动行为的纪律**：
+
+- 等价重构 → `run.sh` 的 `diff` 必须为空；
+- 有意改行为 → 用 `./verify.sh --update` 重新生成 golden，并在 commit 里
+  **逐条解释每一处 diff**（`git diff tests/golden/` 会精确指出变了哪几条命令）。
+
+**golden 的性质**：它记录的是**当前 HEAD 的行为**（重构早已合入，"改动前"的基线
+已无从取得），因此是一张"现状快照"，不是"重构前后等价"的证明。
+
+**写新命令时的三条可复现性前提**（违反任何一条都会让 golden 变成噪声源）：
+
+1. 全部用**相对路径**（cwd = 仓库根）；脚本会把绝对路径归一化为 `@OUT@` / `@REPO@`。
+2. **不要**把 `--stats` / `--bench` 放进 `run.sh`：它们打印计时值（`%.2f ms`）。
+   计时类断言放 `run3.sh` 做字段级检查。
+3. fixture 保持小（< 2 MiB）：单分片 → 单 worker 产出 → 打印顺序确定；
+   且耗时远低于进度条的 200 ms 刷新间隔 → 不会插入带百分比的中间帧。
+   唯一例外是 `chunk-straddle-*` / `chunk-boundary-*` 两条（分片重叠窗口契约）
+   —— 它们**故意**跨分片，因此用 `-c` + `--dump` 把输出压成"结论行 + 归并后的
+   dump"两段确定的文本；2 MiB 的输入由脚本在临时目录现造，不进仓库。
 
 ### 关于测试输出的噪声（均为预期行为，非失败）
 
@@ -372,6 +402,12 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
 1. 「变更 ADR 0005」`--no-color` 现在**真正生效**（等价于 `--color never`）。
    颜色默认是 `--color always`；`--color auto` 按 stdout 是否 TTY 判定。
    原实现接受 `--no-color` 却恒为彩色（`use_color` 恒 `true`），且没有 `--color`。
+   **2026-10-10 修正**：进度条此前绕过 `--color` —— `scan.odin` 里
+   `progress_init` 的实参写成了 `(p, total, true, progress_on)`，而形参是
+   `(p, total, use_color, enabled)`，于是 `use_color` 被写死为 `true`：
+   `--color never` 下命中高亮不染色了，进度条那一行的 ANSI 绿色转义却仍在往
+   stdout 吐（重定向到文件或管道时可见）。现已改为传 `o.use_color`，
+   由 `tests/run3.sh` 的"整段输出无 ANSI"断言锁住。
 2. 「契约」**分片重叠窗口内的命中会重复上报**。每个任务向后多扫 16 字节
    （`CHUNK_OVERLAP`）以避免切断跨分片匹配，导致偏移落在
    `[分片边界, 分片边界+16)` 的命中被两个任务各报一次（`--dump` 与 `--count`

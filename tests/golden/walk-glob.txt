@@ -1,0 +1,11 @@
+=== cmd ===
+xrep -r --glob *.txt test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+tests/fixtures/dir/a.txt:1:0
+tests/fixtures/dir/sub/c.txt:1:0
+
+Scanned 2 files, total hits: 2
+=== stderr ===
+=== files ===

@@ -1,0 +1,11 @@
+=== cmd ===
+xrep -c --dump @OUT@/d.txt test @SETUP@/chunk_straddle.bin
+=== exit ===
+0
+=== stdout ===
+[32;1m[########################################][0m 100.00% 2098192/2098176 bytes
+@SETUP@/chunk_straddle.bin: 1 hits
+=== stderr ===
+=== files ===
+--- d.txt ---
+2097150

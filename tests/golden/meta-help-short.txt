@@ -1,0 +1,61 @@
+=== cmd ===
+xrep -h
+=== exit ===
+0
+=== stdout ===
+xrep - fast binary pattern search tool
+Usage: xrep <pattern> [files/dirs...] [flags]
+
+Matching:
+  -i,--ignore-case     case insensitive match
+  -e,--pattern PATTERN add pattern (repeatable, multiple patterns)
+  -f,--file FILE       read patterns line by line from FILE
+  --after N            offset >= N
+  --before N           offset <= N
+  -m,--max-count N     report at most N matches per file (0 = unlimited)
+  --limit N            limit pretty summary items (0 = unlimited)
+
+Searching:
+  -r,--recursive       search directories recursively
+  -g,--glob GLOB       only files matching GLOB (repeatable)
+  --exclude GLOB       skip files/dirs matching GLOB (repeatable)
+  --hidden             include dotfiles (default: skipped)
+  --max-size N         skip files larger than N bytes
+  -t,--threads N       worker thread count (clamped to 1..cpu*4)
+
+Output:
+  -c,--count           only print hit count per file
+  -n,--line-number     include 1-based line number
+  -o,--only-matching   also print the matched bytes in hex
+  -l,--files-with-matches    print only names of files with matches
+  -L,--files-without-match   print only names of files without matches
+  --context N          show N bytes context in hex
+  --offset-hex         print offsets in hexadecimal
+  --json,--jsonl       JSON Lines output
+  --color WHEN         always|never|auto (default: always)
+  --stats              print run summary to stderr
+  --quiet,-q           no stdout (dump + stderr errors only)
+
+Dump:
+  --dump FILE          write all matched offsets to single file
+  --dump-prefix P      write per-file dump: P{sanitized filename}.txt
+  --dump-append        append to dump file instead of overwriting
+  --skip-empty         do not create dump files for files with 0 hits
+
+Misc:
+  --test               run built-in self test
+  --bench              run benchmark
+  -v,--version         show version
+  -h,--help            show this help
+
+Examples:
+  xrep ABC data.bin                       # match ABC in one file
+  xrep abc f.bin -i -c                    # case-insensitive count
+  xrep GET -r ./logs --glob '*.log'       # recursive over *.log
+  xrep TODO -r src --exclude '*.min.js'   # add exclusions
+  xrep -e foo -e bar -r . -n              # multi-pattern with line numbers
+  xrep GET app.log --json --stats         # JSON Lines + summary
+  xrep GET big.bin --max-size 104857600   # skip files over 100 MiB
+  xrep GET *.log --dump-prefix out_       # per-file dumps out_*.txt
+=== stderr ===
+=== files ===

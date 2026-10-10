@@ -1,0 +1,17 @@
+=== cmd ===
+xrep --dump @OUT@/d.txt --offset-hex test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+match offset: 0x6
+match offset: 0x11
+match offset: 0x3a
+[32;1m[########################################][0m 100.00% 63/63 bytes
+
+=== tests/fixtures/a.txt: 1 results ===
+=== stderr ===
+=== files ===
+--- d.txt ---
+0x6
+0x11
+0x3a

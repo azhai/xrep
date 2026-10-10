@@ -1,0 +1,11 @@
+=== cmd ===
+xrep -r --exclude sub test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+tests/fixtures/dir/a.txt:1:0
+tests/fixtures/dir/b.bin:1:0
+
+Scanned 2 files, total hits: 2
+=== stderr ===
+=== files ===

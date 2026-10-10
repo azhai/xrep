@@ -257,7 +257,12 @@ scan_region_parallel :: proc(file_data: []u8, o: Scan_Options, label: string) ->
     // 混进 `path:line:offset` / JSON 会破坏管道消费。
     progress_on := !o.quiet && legacy_output(o)
     prog: Progress
-    progress_init(&prog, u64(file_size), true, progress_on)
+    // 实参顺序是 (use_color, enabled) —— 形参签名见 progress.odin:29。
+    // 曾经在这里写过 `true, progress_on`，把 use_color 写死成"永远着色"，
+    // 于是 `--color never` / `--no-color` 只管住了命中高亮，进度条那一行
+    // 仍在往 stdout 吐 ANSI 转义（重定向到文件/管道时可见）。
+    // 改这一行时注意别把两个 bool 再写反。
+    progress_init(&prog, u64(file_size), o.use_color, progress_on)
     defer progress_destroy(&prog)
 
     // ---- 4) 先启动输出线程（消费者），再启动 worker（生产者）----

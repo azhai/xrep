@@ -1,0 +1,9 @@
+=== cmd ===
+xrep --color always --count test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+[32;1m[########################################][0m 100.00% 63/63 bytes
+tests/fixtures/a.txt: 3 hits
+=== stderr ===
+=== files ===

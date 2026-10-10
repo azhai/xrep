@@ -1,0 +1,8 @@
+=== cmd ===
+xrep --dump @OUT@/d.txt --dump-prefix @OUT@/p_ test tests/fixtures/a.txt
+=== exit ===
+1
+=== stdout ===
+=== stderr ===
+Error: --dump and --dump-prefix are mutually exclusive
+=== files ===

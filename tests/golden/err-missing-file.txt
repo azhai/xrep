@@ -1,0 +1,8 @@
+=== cmd ===
+xrep test tests/fixtures/nope.bin
+=== exit ===
+0
+=== stdout ===
+=== stderr ===
+open tests/fixtures/nope.bin failed: Not_Exist
+=== files ===

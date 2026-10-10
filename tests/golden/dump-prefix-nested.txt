@@ -1,0 +1,19 @@
+=== cmd ===
+xrep --dump-prefix @OUT@/pfx_ -r test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+tests/fixtures/dir/a.txt:1:0
+tests/fixtures/dir/b.bin:1:0
+tests/fixtures/dir/sub/c.txt:1:0
+
+Scanned 4 files, total hits: 3
+=== stderr ===
+=== files ===
+--- pfx_tests_fixtures_dir_a.txt.txt ---
+0
+--- pfx_tests_fixtures_dir_b.bin.txt ---
+0
+--- pfx_tests_fixtures_dir_sub_c.txt.txt ---
+0
+--- pfx_tests_fixtures_dir_sub_deep_d.bin.txt ---

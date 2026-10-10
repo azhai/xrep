@@ -1,0 +1,8 @@
+=== cmd ===
+xrep -r -L test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+tests/fixtures/dir/sub/deep/d.bin
+=== stderr ===
+=== files ===

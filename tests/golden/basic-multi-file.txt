@@ -1,0 +1,12 @@
+=== cmd ===
+xrep test tests/fixtures/a.txt tests/fixtures/b.txt
+=== exit ===
+0
+=== stdout ===
+tests/fixtures/a.txt:1:6
+tests/fixtures/a.txt:2:17
+tests/fixtures/a.txt:5:58
+
+Scanned 2 files, total hits: 3
+=== stderr ===
+=== files ===

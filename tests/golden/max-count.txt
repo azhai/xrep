@@ -1,0 +1,12 @@
+=== cmd ===
+xrep -m 2 test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+match offset: 6
+match offset: 17
+[32;1m[########################################][0m 100.00% 63/63 bytes
+
+=== tests/fixtures/a.txt: 0 results ===
+=== stderr ===
+=== files ===

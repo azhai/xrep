@@ -1,0 +1,10 @@
+=== cmd ===
+xrep --no-such-flag test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+
+Scanned 2 files, total hits: 0
+=== stderr ===
+open test failed: Not_Exist
+=== files ===

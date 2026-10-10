@@ -1,0 +1,8 @@
+=== cmd ===
+xrep -f @OUT@/no-such-pats.txt tests/fixtures/a.txt
+=== exit ===
+1
+=== stdout ===
+=== stderr ===
+cannot read pattern file: @OUT@/no-such-pats.txt
+=== files ===

@@ -1,0 +1,17 @@
+=== cmd ===
+xrep --dump-prefix @OUT@/pfx_ test ./tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+match offset: 6
+match offset: 17
+match offset: 58
+[32;1m[########################################][0m 100.00% 63/63 bytes
+
+=== ./tests/fixtures/a.txt: 1 results ===
+=== stderr ===
+=== files ===
+--- pfx_._tests_fixtures_a.txt.txt ---
+6
+17
+58

@@ -1,0 +1,10 @@
+=== cmd ===
+xrep -n test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+1:6
+2:17
+5:58
+=== stderr ===
+=== files ===

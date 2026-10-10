@@ -1,0 +1,8 @@
+=== cmd ===
+xrep --threads abc test tests/fixtures/a.txt
+=== exit ===
+1
+=== stdout ===
+=== stderr ===
+invalid threads: abc
+=== files ===

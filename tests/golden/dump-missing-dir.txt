@@ -1,0 +1,14 @@
+=== cmd ===
+xrep --dump @OUT@/no-such-dir/d.txt test tests/fixtures/a.txt
+=== exit ===
+1
+=== stdout ===
+match offset: 6
+match offset: 17
+match offset: 58
+[32;1m[########################################][0m 100.00% 63/63 bytes
+
+=== tests/fixtures/a.txt: 1 results ===
+=== stderr ===
+Failed to open dump file @OUT@/no-such-dir/d.txt: Not_Exist
+=== files ===

@@ -1,0 +1,8 @@
+=== cmd ===
+xrep test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+=== stderr ===
+xrep: tests/fixtures/dir: is a directory (use -r to search recursively)
+=== files ===

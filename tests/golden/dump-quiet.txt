@@ -1,0 +1,11 @@
+=== cmd ===
+xrep --dump @OUT@/d.txt -q test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+=== stderr ===
+=== files ===
+--- d.txt ---
+6
+17
+58

@@ -1,0 +1,10 @@
+=== cmd ===
+xrep --json test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+{"file":"tests/fixtures/a.txt","line":1,"offset":6,"len":4}
+{"file":"tests/fixtures/a.txt","line":2,"offset":17,"len":4}
+{"file":"tests/fixtures/a.txt","line":5,"offset":58,"len":4}
+=== stderr ===
+=== files ===

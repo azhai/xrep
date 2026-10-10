@@ -1,0 +1,13 @@
+=== cmd ===
+xrep -o test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+match offset: 6
+  matched hex: 74657374
+match offset: 17
+  matched hex: 74657374
+match offset: 58
+  matched hex: 74657374
+=== stderr ===
+=== files ===

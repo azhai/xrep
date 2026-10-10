@@ -1,0 +1,10 @@
+=== cmd ===
+xrep -r -l test tests/fixtures/dir
+=== exit ===
+0
+=== stdout ===
+tests/fixtures/dir/a.txt
+tests/fixtures/dir/b.bin
+tests/fixtures/dir/sub/c.txt
+=== stderr ===
+=== files ===

@@ -1,0 +1,8 @@
+=== cmd ===
+xrep --json --count test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+{"file":"tests/fixtures/a.txt","count":3}
+=== stderr ===
+=== files ===

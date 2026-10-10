@@ -1,0 +1,16 @@
+=== cmd ===
+xrep --context 8 test tests/fixtures/a.txt
+=== exit ===
+0
+=== stdout ===
+match offset: 6
+  context hex: 68 65 6c 6c 6f 20 [31;1m74 [0m[31;1m65 [0m[31;1m73 [0m[31;1m74 [0m20 77 6f 72 6c 64 0a 74 
+match offset: 17
+  context hex: 74 20 77 6f 72 6c 64 0a [31;1m74 [0m[31;1m65 [0m[31;1m73 [0m[31;1m74 [0m20 61 67 61 69 6e 0a 54 
+match offset: 58
+  context hex: 72 65 0a 6c 61 73 74 20 [31;1m74 [0m[31;1m65 [0m[31;1m73 [0m[31;1m74 [0m0a 
+[32;1m[########################################][0m 100.00% 63/63 bytes
+
+=== tests/fixtures/a.txt: 1 results ===
+=== stderr ===
+=== files ===

@@ -1,0 +1,10 @@
+=== cmd ===
+xrep --dump @OUT@/d.txt test tests/fixtures/empty.bin
+=== exit ===
+0
+=== stdout ===
+
+=== tests/fixtures/empty.bin: 0 results ===
+=== stderr ===
+=== files ===
+--- d.txt ---

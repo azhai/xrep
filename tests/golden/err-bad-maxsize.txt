@@ -1,0 +1,8 @@
+=== cmd ===
+xrep --max-size abc test tests/fixtures/a.txt
+=== exit ===
+1
+=== stdout ===
+=== stderr ===
+invalid max-size: abc
+=== files ===
