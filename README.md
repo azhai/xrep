@@ -25,6 +25,78 @@ OUT=xrep2 ./build.sh    # 自定义输出名
 原因：本机 PATH 里的 `clang` 可能被 Android NDK 的 x86_64 clang 抢先占用，
 导致 Odin 链接阶段报 `unknown file type *.o`。手工编译时请自行带上同样参数。
 
+## 交叉编译
+
+`Makefile` 负责把 xrep 编到其它平台，产物落在 `dist/`：
+
+```bash
+make               # 全部主流 + 扩展平台（默认 = all）
+make main          # 五大主流：darwin x2 / linux amd64+arm64 / windows amd64
+make host          # 只编当前机器平台
+make extra         # linux 386 / arm / riscv64，freebsd amd64+arm64
+make musl          # Linux 静态变体（musl，不依赖目标机 glibc 版本）
+make universal     # macOS universal2（arm64 + amd64 用 lipo 合并）
+make check         # 用 file(1) 核对每个产物的真实格式
+make list          # 打印平台表
+make clean         # 清掉 dist/ 与 .build/
+```
+
+产物命名 `xrep-<os>-<arch>`（Windows 带 `.exe`）。
+
+### 为什么需要 zig
+
+Odin 的原生链接器在本机只能链接**本机平台**和 `darwin_amd64`（走 macOS SDK）；
+对 `linux_*` / `windows_*` 会直接报
+`Linking for cross compilation for this platform is not yet supported`。
+
+因此 Makefile 分两条路：
+
+| 路线 | 覆盖 | 做法 |
+| --- | --- | --- |
+| A | `darwin_arm64` / `darwin_amd64` | odin 原生链接（`-linker:lld`），不需要 zig |
+| B | 其余全部平台 | odin 只编译（`-build-mode:obj`），再用 `zig cc -target <triple>` 链接 |
+
+zig 自带各平台 libc 与 Windows 导入库，因此不需要 sysroot，也不需要真的
+Windows SDK（Makefile 只给一个空目录应付 odin 的 `-windows-sdk-root` 检查）。
+
+### 两个 Windows 特异补丁
+
+Odin 产出的 COFF 目标文件会引用两个 mingw 未提供的符号，Makefile 已处理，
+改动链接方式时别漏掉：
+
+- `BCryptGenRandom` —— Odin runtime 的随机源 → 加 `-lbcrypt`。
+- `_fltused` —— MSVC 的浮点使用标记，mingw 无定义 → Makefile 现编译一个
+  空符号垫片 `int _fltused = 0x9875;` 一起链接。
+
+### 平台表
+
+| 短名 | odin target | zig triple |
+| --- | --- | --- |
+| `darwin-arm64` | `darwin_arm64` | （原生链接） |
+| `darwin-amd64` | `darwin_amd64` | （原生链接） |
+| `linux-amd64` | `linux_amd64` | `x86_64-linux-gnu` |
+| `linux-arm64` | `linux_arm64` | `aarch64-linux-gnu` |
+| `windows-amd64` | `windows_amd64` | `x86_64-windows-gnu` |
+| `linux-386` | `linux_i386` | `x86-linux-gnu` |
+| `linux-arm` | `linux_arm32` | `arm-linux-gnueabihf` |
+| `linux-riscv64` | `linux_riscv64` | `riscv64-linux-gnu` |
+| `freebsd-amd64` | `freebsd_amd64` | `x86_64-freebsd-none` |
+| `freebsd-arm64` | `freebsd_arm64` | `aarch64-freebsd-none` |
+| `linux-amd64-musl` | `linux_amd64` | `x86_64-linux-musl`（静态） |
+| `linux-arm64-musl` | `linux_arm64` | `aarch64-linux-musl`（静态） |
+
+### 已知限制
+
+- **`windows_i386` 不提供**：Odin 对 i386 Windows 会关掉 TLS，但生成的
+  `__tls_index` 与 mingw 的 `tlssup.obj` 冲突（duplicate symbol）。
+- **wasm 目标不提供**：`odin build` 会把 `*_test.odin` 一并编译，而 Odin 的
+  `core:testing` 在 `wasi_wasm32` / `js_wasm32` 下自身就编译不过
+  （`_fini_terminal` / `do_level_header` 未声明）。等上游修复后再加。
+- **版本匹配**：已在 odin `dev-2026-10`、zig `0.17.0` 上验证。zig 0.17 起
+  i386 的架构名是 `x86`（旧名 `i386` 会报 unknown architecture）。
+- **验证深度**：所有产物均通过 `file(1)` 格式核对，darwin 产物实际运行过
+  `--version` / `--test`；非本机平台只做到"链接成功 + 格式正确"，未在真机执行。
+
 ## 用法
 
 ```bash
@@ -266,7 +338,7 @@ TESTS_FILTER=dump ./verify.sh   # 只跑名字含 dump 的命令
 
 | 脚本 | 内容 | 规模 |
 | --- | --- | --- |
-| `tests/run.sh <bin> [outdir]` | 历史命令 **golden 矩阵**：全部旧标志组合、错误路径、多线程、dump、`--test`/`--help`、分片重叠窗口契约。每条采集 stdout / stderr / 退出码 / **它产出的所有文件**，与 `tests/golden/<name>.txt` 逐字节比对 | 77 条命令 |
+| `tests/run.sh <bin> [outdir]` | 历史命令 **golden 矩阵**：全部旧标志组合、错误路径、多线程、dump、`--test`/`--help`、分片重叠窗口契约。每条采集 stdout / stderr / 退出码 / **它产出的所有文件**，与 `tests/golden/<name>.txt` 逐字节比对 | 78 条命令 |
 | `tests/run2.sh <bin>` | ADR 0002 那批新增/变更行为的**断言**（版本、线程夹取、dump-prefix 清洗、dump 失败退出码、skip-empty、dump-append、max-size、多文件汇总、空文件、参数互斥） | 34 条断言 |
 | `tests/run3.sh <bin>` | krep 对齐功能的**断言**（`-r`、glob/exclude/hidden、`-l/-L`、`-n`、`-o`、`-m`、`-e/-f`、`--json`、`--stats`、`--color`、短标志捆绑、单文件默认输出回归护栏） | 56 条断言 |
 | `tests/lib.sh` | run2/run3 共用的断言小工具（`eq`/`has`/`hasnt`/`file_eq`/`exists`/`missing`/`run`） | — |

@@ -245,6 +245,9 @@ cmd dump-quiet          --dump @OUT@/d.txt -q test tests/fixtures/a.txt
 cmd dump-prefix         --dump-prefix @OUT@/pfx_ test tests/fixtures/a.txt
 cmd dump-prefix-dot     --dump-prefix @OUT@/pfx_ test ./tests/fixtures/a.txt
 cmd dump-prefix-nested  --dump-prefix @OUT@/pfx_ -r test tests/fixtures/dir
+# 结构化输出（-n / --json）+ 多文件时的**逐文件** dump：每个输入文件一份
+# `P{sanitized(path)}.txt`，0 命中的文件也照常产出空文件（除非 --skip-empty）。
+# 这条把"输出模式与落盘互不干扰"钉住：换输出模式不该改变落盘的份数与内容。
 cmd dump-prefix-walk-json -r --json --dump-prefix @OUT@/p_ test tests/fixtures/dir
 cmd dump-skip-empty-0   --dump @OUT@/d.txt --skip-empty zzz-nope tests/fixtures/a.txt
 cmd dump-skip-empty-1   --dump @OUT@/d.txt --skip-empty test tests/fixtures/a.txt

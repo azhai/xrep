@@ -78,5 +78,20 @@
 - 结果：run.sh 57s → **1.85s**，`./verify.sh` 64s → **10s**；golden 一个字节没变
   （77/77 依旧全绿），`tests/.out` 跑完即空。
 
+## 2026-10-18（续）—— 多文件 + --json 下的 dump-prefix 落盘
+- 新增第 78 条命令 `dump-prefix-walk-json`：`-r --json --dump-prefix @OUT@/p_`
+  扫 `tests/fixtures/dir`。它钉住"**输出模式与落盘互不干扰**"这一契约：
+  换 `-n` / `--json` 不该改变落盘的份数与内容。
+- 快照要点（与 `walk-json`（不带 dump-prefix）对照）：
+  - stdout 完全一致（3 条 JSON 命中），说明结构化输出不受落盘影响；
+  - 落地 **4** 个文件（a.txt / b.bin / sub/c.txt / sub/deep/d.bin），
+    `sub/deep/d.bin` 是 0 命中但仍产出**空文件**（未加 `--skip-empty`）；
+  - `.hidden/e.txt` 不在其中——默认跳过隐藏项，与 walk 的取舍一致。
+- 确定性：换三个不同 outdir 各跑一次 → 均 78/78 PASS，golden 零 diff。
+- `./verify.sh` → 全绿（129 单测 + 78 golden + 34 + 56）。
+- 踩到一次环境坑：本 shell 的 PATH **不含** `/opt/homebrew/bin`，
+  `./test.sh` 直接 `odin: command not found`（golden 阶段因为用的是已存在的
+  `./xrep` 反而能过，容易误判"只有单测坏了"）。跑法：`PATH="/opt/homebrew/bin:$PATH" ./verify.sh`。
+
 ## 遗留（未处理）
 - `output_queue_pop` 的出队是 O(队列长度) 整体左移，密集命中下可能退化。
