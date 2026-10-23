@@ -18,22 +18,25 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:time"
+import "xrep:app"
+import "xrep:engine"
+import "xrep:lib"
 
 main :: proc() {
     // 全局表（lower_table / alg_table）**不在这里初始化**：
     //   * alg_table 是编译期常量，随二进制固化；
-    //   * lower_table 由 common.odin 里的 `@(init)` 过程在进程启动时自动填充。
+    //   * lower_table 由 lib/base.odin 里的 `@(init)` 过程在进程启动时自动填充。
     // 这样 main 与 `odin test` 的启动路径完全一致，不存在"测试忘了初始化全局表"
     // 的问题（详见 README「测试」章节）。
 
     // 参数解析只产出数据；错误/帮助/版本的退出策略在此处统一决定。
-    opts, outcome, message := parse_args(os.args[1:])
+    opts, outcome, message := app.parse_args(os.args[1:])
     switch outcome {
     case .Help:
-        print_help()
+        app.print_help()
         os.exit(0)
     case .Version:
-        print_version()
+        app.print_version()
         os.exit(0)
     case .Error:
         fmt.fprintln(os.stderr, message)
@@ -44,29 +47,29 @@ main :: proc() {
 
     // 子命令优先级：--test > --bench > 正常扫描。
     if opts.run_test {
-        _ = run_tests()
+        _ = app.run_tests()
         os.exit(0)
     }
     if opts.do_bench {
-        run_bench()
+        app.run_bench()
         os.exit(0)
     }
 
     // 模式或文件缺失时打印用法并以 1 退出（注意：该判定在 --test/--bench 之后）。
     if len(opts.pattern) == 0 || len(opts.file_list) == 0 {
-        print_help()
+        app.print_help()
         os.exit(1)
     }
 
     // --threads 合法性：0 会让任务无人消费（静默 0 命中），超大值会拖垮进程。
     // 夹到 [1, 逻辑核心数 × 4]；探测不到核心数时用固定上界。
-    opts.thread_count = clamp_thread_count(opts.thread_count, max_threads_for_machine())
+    opts.thread_count = lib.clamp_thread_count(opts.thread_count, app.max_threads_for_machine())
 
     // 颜色：默认 always（与加 --color 之前一致），--color=auto 才跟随终端。
-    use_color := resolve_color(opts.color_mode)
+    use_color := engine.resolve_color(opts.color_mode)
 
     // ---- 输入展开：目录 → 文件列表（-r / --glob / --exclude / --hidden）----
-    files := walk_expand(opts.file_list[:], Walk_Options{
+    files := app.walk_expand(opts.file_list[:], lib.Walk_Options{
         recursive = opts.recursive,
         hidden = opts.hidden,
         globs = opts.globs[:],
@@ -80,9 +83,9 @@ main :: proc() {
     show_path := opts.recursive || len(files) > 1
 
     // cli.Options → scan.Scan_Options：一次映射，避免每个调用点重复十几二十个实参。
-    stats: Run_Stats
-    scan_opts := Scan_Options{
-        ctx = match_ctx_from_options(&opts),
+    stats: lib.Run_Stats
+    scan_opts := lib.Scan_Options{
+        ctx = app.match_ctx_from_options(&opts),
         after = opts.after,
         before = opts.before,
         limit = opts.limit,
@@ -113,7 +116,7 @@ main :: proc() {
     total_hits: uint = 0
     io_failed := false
     for f in files {
-        hits, dump_ok := scan_file(f, scan_opts)
+        hits, dump_ok := app.scan_file(f, scan_opts)
         total_hits += hits
         if !dump_ok {
             io_failed = true
@@ -121,7 +124,7 @@ main :: proc() {
     }
 
     // 扫描期结束，文件路径字符串不再需要（只余计数）。
-    walk_free(&files)
+    app.walk_free(&files)
 
     // 多文件汇总统计：受 --quiet 控制。
     // 行：-l/-L/--json 的输出要能直接进管道（xargs / jq），故这些模式下不追加汇总。
@@ -136,7 +139,7 @@ main :: proc() {
 
     // 以上资源由 parse_args / walk_expand 分配，均需显式归还：
     // 下方都是 os.exit（不会展开 defer），所以在此处手动释放。
-    options_destroy(&opts)
+    app.options_destroy(&opts)
 
     // 落盘失败必须反映到退出码，否则脚本会误判"扫描成功"。
     if io_failed {
@@ -146,7 +149,7 @@ main :: proc() {
 }
 
 // --stats 的输出行（固定写 stderr）。
-print_stats :: proc(st: ^Run_Stats, elapsed: time.Duration) {
+print_stats :: proc(st: ^lib.Run_Stats, elapsed: time.Duration) {
     fmt.fprintf(
         os.stderr,
         "stats: %d files scanned, %d with matches, %d skipped, %d bytes, %d hits, %.2f ms\n",

@@ -43,6 +43,12 @@ BUILD ?= .build
 # darwin 原生链接使用的链接器
 LINKER ?= lld
 
+# 源码按职责拆成子目录包（lib/search/engine/app），Odin 的 import 路径相对
+# 源文件所在目录解析，兄弟包必须靠 collection 互相引用（见 ADR 0006 / 0007）。
+# 注意：Makefile 里用绝对路径 $(CURDIR)，避免 `make -C` 时解析错位。
+COLLECTION ?= xrep=$(CURDIR)
+ODIN_FLAGS ?= -collection:$(COLLECTION)
+
 # zig cc 的编译选项。-O2 是链接期优化等级，与 odin 的 -o:$(OPT) 无关。
 ZIG_CFLAGS ?= -O2
 
@@ -55,7 +61,7 @@ export ODIN_CC
 # 需要 SDK 内容，给一个空目录即可通过该检查（zig 自带 mingw 导入库）。
 WINSDK ?= $(BUILD)/winsdk
 
-VERSION := $(shell grep -m1 'XREP_VERSION ::' common.odin | cut -d'"' -f2)
+VERSION := $(shell grep -m1 'XREP_VERSION ::' lib/base.odin | cut -d'"' -f2)
 ZIG_PATH := $(shell command -v $(ZIG) 2>/dev/null)
 
 # ---- 平台表生成 ------------------------------------------------------------
@@ -81,7 +87,7 @@ $(1):
 	@mkdir -p $(DIST) $(BUILD) $(WINSDK)
 ifeq ($(6),native)
 	@echo "==> $(1)	[odin 原生链接]"
-	$(ODIN) build . -target:$(2) -o:$(OPT) -linker:$(LINKER) -out:$(DIST)/xrep-$(1)$(4)
+	$(ODIN) build . $(ODIN_FLAGS) -target:$(2) -o:$(OPT) -linker:$(LINKER) -out:$(DIST)/xrep-$(1)$(4)
 else
 	@echo "==> $(1)	[obj -> $(ZIG) cc -target:$(3)]"
 	@if [ -z "$(ZIG_PATH)" ]; then \
@@ -89,7 +95,7 @@ else
 		echo "      安装：brew install zig   （或改用 'make host' 只构建本机平台）" >&2; \
 		exit 1; \
 	fi
-	$(ODIN) build . -target:$(2) -build-mode:obj -o:$(OPT) -out:$(BUILD)/$(1).o \
+	$(ODIN) build . $(ODIN_FLAGS) -target:$(2) -build-mode:obj -o:$(OPT) -out:$(BUILD)/$(1).o \
 		$(if $(findstring windows,$(2)),-windows-sdk-root:$(WINSDK),)
 	$(ZIG) cc -target $(3) $(ZIG_CFLAGS) $(BUILD)/$(1).o $(5) -o $(DIST)/xrep-$(1)$(4)
 	@rm -f $(DIST)/xrep-$(1).pdb   # lld-link 顺手生成的调试库，分发不需要
@@ -125,7 +131,7 @@ HOST_OS   := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 HOST_ARCH := $(patsubst x86_64,amd64,$(shell uname -m))
 HOST_TARGET := $(HOST_OS)-$(HOST_ARCH)
 
-.PHONY: all main extra musl host universal check list clean distclean test checksums
+.PHONY: all main extra musl host universal check list clean distclean test checksums deps guard
 
 .DEFAULT_GOAL := all
 
@@ -145,7 +151,7 @@ host:
 		$(MAKE) $(HOST_TARGET); \
 	else \
 		echo "==> host [$(HOST_TARGET) 不在平台表中，直接 odin build]"; \
-		$(ODIN) build . -o:$(OPT) -linker:$(LINKER) -out:$(DIST)/xrep-$(HOST_TARGET); \
+		$(ODIN) build . $(ODIN_FLAGS) -o:$(OPT) -linker:$(LINKER) -out:$(DIST)/xrep-$(HOST_TARGET); \
 	fi
 
 # macOS universal2：把 arm64 与 amd64 两个 Mach-O 合并为一个胖二进制。
@@ -177,6 +183,25 @@ list:
 		"freebsd-arm64         freebsd_arm64      aarch64-freebsd-none" \
 		"linux-amd64-musl      linux_amd64        x86_64-linux-musl (静态)" \
 		"linux-arm64-musl      linux_arm64        aarch64-linux-musl (静态)"
+
+# 包依赖方向自检：底层不得反向依赖上层（ADR 0006）。
+# 允许的依赖白名单按层级递增——改结构时同步改这里。
+deps:
+	@echo "==> 包依赖方向（main → app → engine → search → lib）"
+	@fail=0; \
+	for pair in "lib:" "search:lib" "engine:lib search" "app:lib search engine"; do \
+		pkg="$${pair%%:*}"; allow=" $${pair#*:} "; \
+		got="$$(grep -rho 'import "xrep:[a-z]*"' $$pkg/*.odin 2>/dev/null | sed 's/.*xrep://;s/"//' | sort -u | tr '\n' ' ')"; \
+		printf '  %-8s -> %s\n' "$$pkg" "$${got:-（无）}"; \
+		for g in $$got; do \
+			case "$$allow" in *" $$g "*) ;; *) echo "  错误：$$pkg 反向或跨层依赖 $$g（只允许：$${pair#*:}）" >&2; fail=1;; esac; \
+		done; \
+	done; \
+	exit $$fail
+
+# 静态护栏：重构工具自检 + 字面量污染检测 + 包依赖方向（verify.sh 的第 0 层）
+guard:
+	@./tools/guard.sh
 
 # 分发校验和（文件名带版本，避免与旧产物混淆）
 checksums:

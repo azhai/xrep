@@ -21,9 +21,16 @@ OPT=speed ./build.sh    # 可选优化级别: -o:none|minimal|size|speed（默�
 OUT=xrep2 ./build.sh    # 自定义输出名
 ```
 
-`build.sh` 会强制 `ODIN_CC=/usr/bin/clang` 并加 `-linker:lld`。
+`build.sh` 会强制 `ODIN_CC=/usr/bin/clang` 并加 `-linker:lld` 与
+`-collection:xrep=.`（源码是子目录包，兄弟包靠 collection 互相引用，见下节）。
 原因：本机 PATH 里的 `clang` 可能被 Android NDK 的 x86_64 clang 抢先占用，
 导致 Odin 链接阶段报 `unknown file type *.o`。手工编译时请自行带上同样参数。
+
+等价的手工命令：
+
+```bash
+ODIN_CC=/usr/bin/clang odin build . -collection:xrep=. -o:size -linker:lld -out:xrep
+```
 
 ## 交叉编译
 
@@ -38,6 +45,7 @@ make musl          # Linux 静态变体（musl，不依赖目标机 glibc 版本
 make universal     # macOS universal2（arm64 + amd64 用 lipo 合并）
 make check         # 用 file(1) 核对每个产物的真实格式
 make list          # 打印平台表
+make guard         # 静态护栏：重构工具自检 + 字面量污染检测 + 包依赖方向
 make clean         # 清掉 dist/ 与 .build/
 ```
 
@@ -89,9 +97,10 @@ Odin 产出的 COFF 目标文件会引用两个 mingw 未提供的符号，Makef
 
 - **`windows_i386` 不提供**：Odin 对 i386 Windows 会关掉 TLS，但生成的
   `__tls_index` 与 mingw 的 `tlssup.obj` 冲突（duplicate symbol）。
-- **wasm 目标不提供**：`odin build` 会把 `*_test.odin` 一并编译，而 Odin 的
-  `core:testing` 在 `wasi_wasm32` / `js_wasm32` 下自身就编译不过
-  （`_fini_terminal` / `do_level_header` 未声明）。等上游修复后再加。
+- **wasm 目标不提供**：与本次拆分无关，是 Odin 上游自身的编译错误——
+  `wasi_wasm32` 挂在 `core/terminal/internal_os.odin` 的 `_fini_terminal` 未声明，
+  `js_wasm32` 挂在 `core:testing` 的 `log.do_level_header` 未声明。等上游修复后再加。
+  （拆分前是同一个错误，不是新引入的。）
 - **版本匹配**：已在 odin `dev-2026-10`、zig `0.17.0` 上验证。zig 0.17 起
   i386 的架构名是 `x86`（旧名 `i386` 会报 unknown architecture）。
 - **验证深度**：所有产物均通过 `file(1)` 格式核对，darwin 产物实际运行过
@@ -180,52 +189,106 @@ Odin 产出的 COFF 目标文件会引用两个 mingw 未提供的符号，Makef
 多文件扫描完成后会多打印一行 `Scanned N files, total hits: M`（受 `--quiet`
 抑制；单文件时不打印）。`--stats` 的统计行固定写 stderr，**不受 `--quiet` 抑制**。
 
-## 文件结构
+## 包结构（子目录即 package）
 
-### 生产代码（15 个文件，约 2600 行含注释）
+源码按职责拆成 4 个子目录包，依赖方向**严格单向**：
 
-依赖方向单向：`main` → 编排模块（`cli`/`scan`/`selftest`/`bench`）→ 并发与 I/O 设施
-（`task_pool`/`output_queue`/`progress`/`worker`/`io_utils`）→
-算法与工具（`matcher`/`merge`/`slice_utils`/`walk`）→ `common`。底层模块不反向引用上层。
+```
+main.odin              package main    入口编排（根目录唯一的生产文件）
+├── app/               package app     CLI 解析与扫描编排
+│   ├── cli.odin       └── 依赖 lib / engine / search
+│   ├── scan.odin
+│   ├── walk.odin
+│   ├── selftest.odin
+│   └── bench.odin
+├── engine/            package engine   并发与 I/O 设施
+│   ├── worker.odin    └── 依赖 lib / search
+│   └── io_utils.odin
+├── search/            package search   匹配算法与归并
+│   ├── matcher.odin   └── 仅依赖 lib
+│   ├── merge.odin
+│   └── slice_utils.odin
+└── lib/               package lib      **全部共享数据结构 + 容器**（不依赖任何本工程包）
+    ├── base.odin          常量、共享类型、字节工具
+    ├── options.odin       Options / Scan_Options / Walk_Options / List_Mode / Parse_Outcome
+    ├── task_pool.odin     Scan_Task + Task_Pool（含 init/push/pop/destroy）
+    ├── output_queue.odin  Output_Item + Output_Queue（含 init/push/pop/destroy）
+    └── progress.odin      进度条操作（类型在 base.odin）
+```
+
+跨包引用一律带包名限定：`lib.Match_Ctx`、`search.select_matcher(...)`、
+`engine.scan_region_parallel(...)`、`app.parse_args(...)`。测试文件与源文件同包，
+可以直接访问本包符号（无需限定）。
+
+**数据结构集中在 `lib`（ADR 0007）**：所有跨模块流转的类型（匹配上下文/结果、
+选项、任务、输出项、进度条）与运行期常量都在 `lib`，各包只保留行为代码。
+于是依赖图的最底层只有一个包，新增消费者不会引出反向依赖。
+
+三个必须知道的 Odin 包机制（详见 ADR 0006）：
+
+1. **一个目录 = 一个 package**，子目录是独立包，不能隐式共享符号。
+2. **`import` 路径相对源文件所在目录解析**。`search/matcher.odin` 里写
+   `import "lib"` 会去找 `search/lib`。因此兄弟包一律用 collection：
+   `import "xrep:lib"`，构建时带 `-collection:xrep=.`（build.sh/test.sh/Makefile
+   已经加好，手工编译别漏）。
+3. **`odin test` 一次只接受一个路径**。`odin test .` 只跑 main 包，子包的
+   `*_test.odin` 不会执行。所以 `test.sh` 逐包跑：`.`、`./lib`、`./search`、
+   `./engine`、`./app`。新增包时记得加进 `test.sh` 的 `PACKAGES`。
+
+反向依赖有自动护栏：`make deps` 打印依赖图，并在出现跨层/反向引用时报错退出
+（已并入 `make guard` / `verify.sh` 第 0 层，见下文「静态护栏」）。
+
+### 生产代码（16 个文件，约 2600 行含注释）
 
 | 文件 | 职责 |
 | --- | --- |
-| `main.odin` | 入口编排：解析参数 → **夹取线程数** → 分派子命令 → **目录展开（`walk_expand`）** → 逐文件扫描 → **汇总统计 → 释放 `file_list`/`Options` → 决定退出码**。全局表初始化已移出（见 `common`/`matcher`） |
-| `cli.odin` | `Options`、`parse_args`（纯解析，不含退出策略；`file_list` **按需分配、调用方负责 `options_destroy`**）、`normalize_args`（`--k=v`、`-t8`、`-rn` 归一化）、短标志别名、`read_pattern_file`、`max_threads_for_machine`、`print_help`/`print_version` |
-| `common.odin` | **运行期常量**（分片大小/重叠窗口/进度刷新间隔/线程上限/版本号）、`lower_table`（**`@(init)` 启动时自动填充**）、`clamp_thread_count`、共享类型（`Match_Ctx`/`Match_Result`/`Match_Fn`/`Algorithm_Entry`/`Color_Mode`/`Run_Stats`）、`s2b` |
-| `matcher.odin` | `single_match` / `naive_match` / `bndm_match` / **`multi_match`（多模式）**，以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`。命中数组用 `context.allocator` 分配、**所有权归调用方**（见 ADR 0004） |
-| `walk.odin` | 目录遍历与 glob：`glob_match`/`walk_dir`/`walk_expand`/`walk_free`、`Walk_Options`（递归、隐藏文件、glob、exclude） |
-| `merge.odin` | `merge_ordered_matches`：多分片命中列表的多路有序归并（游标临时缓冲用后即释放） |
-| `slice_utils.odin` | 泛型切片工具：map / fold / filter / take / drop / sort |
-| `task_pool.odin` | 扫描任务池（`Scan_Task` + Mutex 保护的动态数组，供 worker 抢占） |
-| `output_queue.odin` | 生产者/消费者输出队列（Mutex + Cond，`done` 标志驱动消费者退出） |
-| `progress.odin` | 终端进度条（`\r` 原地刷新 + 限流，`--quiet` 或非传统输出模式时整体关闭） |
-| `worker.odin` | `worker_steal`（扫描线程）与 `output_thread`（唯一打印线程，含 JSON/行导向/`-o`/`-m` 分支）；**线程入口先归一化 `context`** |
-| `io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加）、**`build_line_index`/`line_of`、`json_escape`、`print_hex_bytes`、`resolve_color`** |
-| `scan.odin` | `Scan_Options` + `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**） |
-| `selftest.odin` | 内建自检 `run_tests`（`--test`），随二进制分发 |
-| `bench.odin` | 微基准 `run_bench`（`--bench`）：A 组算法吞吐 + B 组端到端线程伸缩 |
+| `main.odin` | 入口编排：解析参数 → **夹取线程数** → 分派子命令 → **目录展开（`walk_expand`）** → 逐文件扫描 → **汇总统计 → 释放 `file_list`/`Options` → 决定退出码**。全局表初始化已移出（见 `lib`/`matcher`） |
+| `lib/base.odin` | **运行期常量**（分片大小/重叠窗口/进度刷新间隔/线程上限/版本号）、`lower_table`（**`@(init)` 启动时自动填充**）、`clamp_thread_count`、共享类型（`Progress`/`Match_Ctx`/`Match_Result`/`Match_Fn`/`Algorithm_Entry`/`Color_Mode`/`Run_Stats`）、`s2b` |
+| `lib/options.odin` | **纯数据**：`Options`（CLI 解析结果）、`Scan_Options`（一次扫描的选项）、`Walk_Options`（目录遍历选项）、`List_Mode`、`Parse_Outcome`。无行为代码 —— 解析在 `app/cli.odin`，编排在 `app/scan.odin`，遍历在 `app/walk.odin`（ADR 0007） |
+| `lib/task_pool.odin` | 扫描任务池：`Scan_Task` + Mutex 保护的动态数组，含 `init/push/pop/destroy`，供 worker 抢占 |
+| `lib/output_queue.odin` | 生产者/消费者输出队列：`Output_Item` + `Output_Queue`，Mutex + Cond，`done` 标志驱动消费者退出 |
+| `lib/progress.odin` | 进度条操作（`\r` 原地刷新 + 限流，`--quiet` 或非传统输出模式时整体关闭）；类型定义在 `base.odin` |
+| `app/cli.odin` | `parse_args`（纯解析，不含退出策略；`file_list` **按需分配、调用方负责 `options_destroy`**）、`normalize_args`（`--k=v`、`-t8`、`-rn` 归一化）、短标志别名、`read_pattern_file`、`max_threads_for_machine`、`print_help`/`print_version` |
+| `search/matcher.odin` | `single_match` / `naive_match` / `bndm_match` / **`multi_match`（多模式）**，以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`。命中数组用 `context.allocator` 分配、**所有权归调用方**（见 ADR 0004） |
+| `app/walk.odin` | 目录遍历与 glob：`glob_match`/`walk_dir`/`walk_expand`/`walk_free`（递归、隐藏文件、glob、exclude 的选项类型是 `lib.Walk_Options`） |
+| `search/merge.odin` | `merge_ordered_matches`：多分片命中列表的多路有序归并（游标临时缓冲用后即释放） |
+| `search/slice_utils.odin` | 泛型切片工具：map / fold / filter / take / drop / sort |
+| `engine/worker.odin` | `worker_steal`（扫描线程）与 `output_thread`（唯一打印线程，含 JSON/行导向/`-o`/`-m` 分支）；**线程入口先归一化 `context`** |
+| `engine/io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加）、**`build_line_index`/`line_of`、`json_escape`、`print_hex_bytes`、`resolve_color`** |
+| `app/scan.odin` | `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**）；选项类型 `lib.Scan_Options` 见 `lib/options.odin` |
+| `app/selftest.odin` | 内建自检 `run_tests`（`--test`），随二进制分发 |
+| `app/bench.odin` | 微基准 `run_bench`（`--bench`）：A 组算法吞吐 + B 组端到端线程伸缩 |
 
 > `arena_pool.odin` 已在 ADR 0004 中删除（arena 定长，无法承载无界的命中结果集）。
+
+### 工具代码（`tools/`，非 Odin）
+
+| 文件 | 职责 |
+| --- | --- |
+| `tools/odin_qualify.py` | **包级重构工具**（Python 3.8+ 标准库）。`qualify` 加包名前缀并同步 `import "xrep:..."`、`strip-self` 去掉自引用前缀、`symbols` 打印各包声明、`check-literals` 字面量护栏、`selftest` 28 项内置回归。词法感知：字符串 / raw string / 字符字面量 / 行注释 / 块注释全部屏蔽后才替换。详见 ADR 0006 |
+| `tools/guard.sh` | 静态护栏：工具自检 → 字面量污染检测 → `make deps`。`verify.sh` 的第 0 层，也可 `make guard` 单独跑 |
+| `tools/literal_allowlist.txt` | 字面量检测的白名单（当前为空；只有**有意**在文本里写 `包名.符号名` 才需要加行） |
 
 ### 测试代码（12 个文件，129 个用例）
 
 | 测试文件 | 覆盖目标 | 用例数 |
 | --- | --- | --- |
-| `io_utils_test.odin` | `context_range` 全部边界、文件读取成功/失败、`file_size_of`、`sanitize_dump_name`（绝对/相对/Windows 保留字符/UTF-8/空串）、dump 各形态、**行号表与 `line_of` 二分、`json_escape`、`hex_digit`、`resolve_color`、`print_hex_bytes` 边界** | 21 |
-| `cli_test.odin` | 参数解析：默认值、位置参数分配、全部长短标志、**`--k=v` 等号形式、短标志捆绑、多模式、`-f`、`--color`、遍历/输出开关**、错误分支、`--help`/`--version` 即时性 | 24 |
-| `scan_test.odin` | 端到端扫描：计数、线程数一致性、区间过滤、`--limit` 契约语义、dump 与 dump-prefix 清洗、`--dump-append`/`--skip-empty`/`--max-size`/空文件快速跳过/落盘失败上报、跨分片归并有序、文件缺失、`-l/-L`、`-m` 截断、多模式端到端、**`Run_Stats` 四条计数各自的累加规则**、`legacy_output` / `line_index_needed` 真值表、**分片重叠窗口的重复上报契约** | 21 |
-| `matcher_test.odin` | 算法选择表边界（1/2/16/17/64/65/0、区间外回退）、重叠命中、大小写、空模式、NUL 字节、算法间一致性、多模式 `multi_match` 与 `select_matcher_for` 分派、稠密命中不被截断（ADR 0004 回归）、**差分测试（8 种模式 × 大小写两态 × 三条实现路径，对照 `core:strings` 参考实现）**、**多模式 = 单模式多重集并集**、**各算法向 `Progress` 上报的字节数** | 13 |
-| `walk_test.odin` | glob 语义（`*` 不跨 `/`、`**` 跨 `/`、`?`、转义、basename 规则）、递归/非递归、隐藏文件、exclude、按后缀过滤、空输入、**不可读目录的容错**、**`strip_dot_slash`/`join_path`/`walk_hidden`/`walk_excluded`/`walk_glob_ok` 纯函数** | 16 |
-| `progress_test.odin` | 初始化字段、禁用时不累加 `scanned`、启用时累加与限流、`total=0` 渲染短路 | 5 |
-| `slice_utils_test.odin` | map/fold/filter/take/drop/sort 的空切片、n=0、n=len、n>len、重复键等边界 | 5 |
-| `common_test.odin` | `lower_table` 填充规则（含非字母透传）、`s2b` 零拷贝、`clamp_thread_count` 边界、常量不变量、**`ctx_pattern_count`/`ctx_pattern_at` 模式表访问器** | 5 |
-| `merge_test.odin` | 空列表集合、单列表、三路交错、空条目、重复偏移、总长度不变量、**8 路随机分片的多重集与升序校验**、**全同偏移的极限形态** | 6 |
-| `output_queue_test.odin` | FIFO、`done` 后立即返回、重复 `set_done`、单生产者/单消费者并发往返、**4 生产者 × 250 条的总数与每生产者 FIFO 校验** | 5 |
-| `task_pool_test.odin` | 空池出队、LIFO 顺序、取空后可复用、**4 线程抢 200 任务：每个任务恰好被弹出一次** | 4 |
-| `worker_test.odin` | **命中偏移从分片相对改写为文件绝对**（`--after/--before`/`--dump`/行号都依赖它）、多任务产出多分片列表、空任务池立即退出、多模式分派确实走 `multi_match`、**输出线程的 `-m` 计数契约与 done 退出** | 4 |
+| `engine/io_utils_test.odin` | `context_range` 全部边界、文件读取成功/失败、`file_size_of`、`sanitize_dump_name`（绝对/相对/Windows 保留字符/UTF-8/空串）、dump 各形态、**行号表与 `line_of` 二分、`json_escape`、`hex_digit`、`resolve_color`、`print_hex_bytes` 边界** | 21 |
+| `app/cli_test.odin` | 参数解析：默认值、位置参数分配、全部长短标志、**`--k=v` 等号形式、短标志捆绑、多模式、`-f`、`--color`、遍历/输出开关**、错误分支、`--help`/`--version` 即时性 | 24 |
+| `app/scan_test.odin` | 端到端扫描：计数、线程数一致性、区间过滤、`--limit` 契约语义、dump 与 dump-prefix 清洗、`--dump-append`/`--skip-empty`/`--max-size`/空文件快速跳过/落盘失败上报、跨分片归并有序、文件缺失、`-l/-L`、`-m` 截断、多模式端到端、**`Run_Stats` 四条计数各自的累加规则**、`legacy_output` / `line_index_needed` 真值表、**分片重叠窗口的重复上报契约** | 21 |
+| `search/matcher_test.odin` | 算法选择表边界（1/2/16/17/64/65/0、区间外回退）、重叠命中、大小写、空模式、NUL 字节、算法间一致性、多模式 `multi_match` 与 `select_matcher_for` 分派、稠密命中不被截断（ADR 0004 回归）、**差分测试（8 种模式 × 大小写两态 × 三条实现路径，对照 `core:strings` 参考实现）**、**多模式 = 单模式多重集并集**、**各算法向 `Progress` 上报的字节数** | 13 |
+| `app/walk_test.odin` | glob 语义（`*` 不跨 `/`、`**` 跨 `/`、`?`、转义、basename 规则）、递归/非递归、隐藏文件、exclude、按后缀过滤、空输入、**不可读目录的容错**、**`strip_dot_slash`/`join_path`/`walk_hidden`/`walk_excluded`/`walk_glob_ok` 纯函数** | 16 |
+| `lib/progress_test.odin` | 初始化字段、禁用时不累加 `scanned`、启用时累加与限流、`total=0` 渲染短路 | 5 |
+| `search/slice_utils_test.odin` | map/fold/filter/take/drop/sort 的空切片、n=0、n=len、n>len、重复键等边界 | 5 |
+| `lib/base_test.odin` | `lower_table` 填充规则（含非字母透传）、`s2b` 零拷贝、`clamp_thread_count` 边界、常量不变量、**`ctx_pattern_count`/`ctx_pattern_at` 模式表访问器** | 5 |
+| `search/merge_test.odin` | 空列表集合、单列表、三路交错、空条目、重复偏移、总长度不变量、**8 路随机分片的多重集与升序校验**、**全同偏移的极限形态** | 6 |
+| `lib/output_queue_test.odin` | FIFO、`done` 后立即返回、重复 `set_done`、单生产者/单消费者并发往返、**4 生产者 × 250 条的总数与每生产者 FIFO 校验** | 5 |
+| `lib/task_pool_test.odin` | 空池出队、LIFO 顺序、取空后可复用、**4 线程抢 200 任务：每个任务恰好被弹出一次** | 4 |
+| `engine/worker_test.odin` | **命中偏移从分片相对改写为文件绝对**（`--after/--before`/`--dump`/行号都依赖它）、多任务产出多分片列表、空任务池立即退出、多模式分派确实走 `multi_match`、**输出线程的 `-m` 计数契约与 done 退出** | 4 |
 
 > 用例数合计 129；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
+> 逐包分布：lib 19、search 24、engine 25、app 61（`odin test` 一次只跑一个包，
+> 见上节）。新增子目录包时，记得把路径加进 `test.sh` 的 `PACKAGES`。
 
 ### 关于"没有输出文本断言"
 
@@ -243,19 +306,26 @@ Odin 产出的 COFF 目标文件会引用两个 mingw 未提供的符号，Makef
 ./verify.sh               # 完整验收：上面这些 + 三套行为验收矩阵（见下节）
 ```
 
-等价的手工命令（注意与 `build.sh` 相同链接器修正）：
+等价的手工命令（注意与 `build.sh` 相同的链接器 + collection 修正）。
+源码已拆成子目录包，`odin test` 一次只跑一个包，所以逐个来：
 
 ```bash
-ODIN_CC=/usr/bin/clang odin test . -linker:lld
+for p in . ./lib ./search ./engine ./app; do
+  ODIN_CC=/usr/bin/clang odin test "$p" -collection:xrep=. -linker:lld
+done
 ```
 
-只跑某个用例、或做单线程排查：
+只跑某个用例、或做单线程排查（用例在哪个包就测哪个包）：
 
 ```bash
-ODIN_CC=/usr/bin/clang odin test . -linker:lld \
+ODIN_CC=/usr/bin/clang odin test ./app -collection:xrep=. -linker:lld \
   -define:ODIN_TEST_NAMES=main.test_parse_args_defaults
-ODIN_CC=/usr/bin/clang odin test . -linker:lld -define:ODIN_TEST_THREADS=1   # 串行执行
+ODIN_CC=/usr/bin/clang odin test ./app -collection:xrep=. -linker:lld \
+  -define:ODIN_TEST_THREADS=1                                    # 串行执行
 ```
+
+> 用例名的包前缀恒为 `main.`（`ODIN_TEST_NAMES` 的语法如此），与源码所在的
+> `xrep:` 包无关，别写成 `app.test_parse_args_defaults`。
 
 其它入口：
 
@@ -355,6 +425,26 @@ TESTS_FILTER=dump ./verify.sh   # 只跑名字含 dump 的命令
 
 **golden 的性质**：它记录的是**当前 HEAD 的行为**（重构早已合入，"改动前"的基线
 已无从取得），因此是一张"现状快照"，不是"重构前后等价"的证明。
+
+### 静态护栏（第 0 层，`tools/guard.sh`）
+
+矩阵能抓住"行为变了"，但有一类问题它发现得**太晚**：拆包时用脚本批量给符号加
+包名前缀，一旦误伤**字符串字面量**，输出文本就被静默改坏，要等 78 条命令跑完
+才知道。为此在 `verify.sh` 最前面加了一层成本极低的检查：
+
+```bash
+./verify.sh        # 自动包含第 0 层
+make guard         # 或单独跑这一层
+```
+
+| 检查 | 拦什么 |
+| --- | --- |
+| `odin_qualify.py selftest` | 工具自身的 28 项回归：字符串 / raw string / 注释 / 结构体字段 / 字面量字段 / proc 参数名 / 成员访问 / **切片语法** / **局部变量撞名** 都不得被误改，并断言"旧错误做法确实会改坏"（证明用例有区分度） |
+| `odin_qualify.py check-literals` | 扫描全部 `.odin`：字符串里出现 `<包>.<该包已知符号>` 即报错。判别式设计——`"xrep GET app.log"` 不会误报，`"OK search.slice_map"` 会被抓 |
+| `make deps` | 包依赖方向单向（`main → app → engine → search → lib`），出现反向/跨层引用即失败 |
+
+误报需要放行时，往 `tools/literal_allowlist.txt` 加一行正则（当前为空）。
+改动背景与复现测试见 ADR 0006。
 
 **写新命令时的三条可复现性前提**（违反任何一条都会让 golden 变成噪声源）：
 
@@ -463,6 +553,20 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
   新增 `walk.odin`（目录遍历 + 自实现 glob）、行导向输出、多模式 `multi_match`、
   `-l/-L`/`-n`/`-o`/`-m`/`--json`/`--stats`/`--color`/短标志别名与 `normalize_args`。
   同时记录了本轮**唯一的有意行为变更**：`--no-color` 从"无效"变为真正生效。
+- `ADR 0006`（`.ai-memory/adr/0006-package-split-into-subdirectories.md`）：
+  **把根目录平铺的 26 个 `.odin` 拆成 4 个子目录包**
+  （`app`/`engine`/`search`/`common`），让目录结构本身表达分层、由编译器强制
+  单向依赖。跨包引用统一加包名限定；兄弟包用 `-collection:xrep=.` 引用；
+  `Progress` 下沉到 common 以解开 common→engine 的环；`odin test` 改为逐包跑。
+  **对外行为零变化**：129 个用例、78 条 golden 矩阵、run2/run3 全部与拆分前一致。
+- `ADR 0007`（`.ai-memory/adr/0007-consolidate-data-structures-into-lib.md`）：
+  **把散落各包的共享数据结构整合进 `lib` 包**。原 `common` 整体并入 `lib` 后删除；
+  `app` 的 `Options`/`Scan_Options`/`Walk_Options`/`List_Mode`/`Parse_Outcome`
+  与 `engine` 的 `Scan_Task`/`Task_Pool`/`Output_Item`/`Output_Queue`（含操作）
+  一并下沉。于是依赖图只有一条链 `main → app → engine → search → lib`，
+  最底层只有 `lib` 一个包 —— 新增消费者不会再引出反向依赖。
+  **对外行为零变化**：129 个用例（逐包 lib 19 / search 24 / engine 25 / app 61）
+  与三套行为矩阵全部与整合前一致。
 
 
 

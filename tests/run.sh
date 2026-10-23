@@ -74,7 +74,7 @@ mkdir -p "$RUN" || {
 trap 'rm -rf "$RUN"' EXIT
 
 # 分片边界相关的两条命令需要一个"大于一个分片"的输入（TASK_CHUNK_SIZE = 2 MiB，
-# 见 common.odin）。这种文件不进仓库（2 MiB × 2），在临时目录里现造：
+# 见 lib/base.odin）。这种文件不进仓库（2 MiB × 2），在临时目录里现造：
 # 全 'z' 填充，只在关键偏移埋一处 "test"。
 #   chunk_straddle.bin —— 埋在 chunk-2：跨越分片边界，只被前一个任务看到
 #   chunk_dup.bin      —— 埋在 chunk  ：完全落在重叠窗口内，被两个任务各报一次

@@ -14,6 +14,11 @@ cd "$(dirname "$0")"
 # 输出二进制名
 OUT="${OUT:-xrep}"
 
+# 源码已按职责拆成子目录包（lib/search/engine/app），见 ADR 0006 / ADR 0007。
+# Odin 的 import 路径是**相对源文件所在目录**解析的，兄弟包之间必须靠
+# collection 才能互相引用，因此统一加 -collection:xrep=.  （路径相对仓库根）。
+COLLECTION="${COLLECTION:-xrep=.}"
+
 # 可选：-o:none|-o:minimal|-o:size|-o:speed（默认 size，兼顾体积与性能）
 OPT="${OPT:-size}"
 
@@ -26,6 +31,7 @@ echo "ODIN_CC = ${ODIN_CC:-<系统默认>}"
 echo "==== odin build -o:${OPT} ===="
 
 odin build . \
+  -collection:"${COLLECTION}" \
   -o:"${OPT}" \
   -linker:lld \
   -out:"${OUT}"

@@ -35,9 +35,18 @@ if [[ -x /usr/bin/clang ]]; then
   export ODIN_CC="${ODIN_CC:-/usr/bin/clang}"
 fi
 
+# 源码已按职责拆成子目录包（lib/search/engine/app），见 ADR 0006 / ADR 0007。
+# **odin test 一次只接受一个路径**：`odin test .` 只跑根目录的 main 包，
+# 子包的 *_test.odin 不会被执行。因此这里逐包跑，用例数是各包之和。
+COLLECTION="${COLLECTION:-xrep=.}"
+PACKAGES=(. ./lib ./search ./engine ./app)
+
 echo "ODIN_CC = ${ODIN_CC:-<系统默认>}"
-echo "==== odin test . （内存追踪开启）===="
-odin test . -linker:lld
+echo "==== odin test （逐包，内存追踪开启）===="
+for pkg in "${PACKAGES[@]}"; do
+  echo "---- package: ${pkg} ----"
+  odin test "${pkg}" -collection:"${COLLECTION}" -linker:lld
+done
 
 echo "==== 内建自检: ./xrep --test ===="
 ./build.sh > /dev/null

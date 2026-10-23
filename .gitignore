@@ -11,3 +11,6 @@
 .workbuddy/
 Thumbs.db
 /tests/.out/
+
+# Python 工具运行期产物
+tools/__pycache__/
