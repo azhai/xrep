@@ -50,6 +50,9 @@ alg_name :: proc(m: lib.Match_Fn) -> string {
     if m == search.bndm_match {
         return "bndm_match"
     }
+    if m == search.memchr_match {
+        return "memchr_match"
+    }
     if m == search.naive_match {
         return "naive_match"
     }

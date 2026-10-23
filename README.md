@@ -246,15 +246,15 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `lib/base.odin` | **运行期常量**（分片大小/重叠窗口/进度刷新间隔/线程上限/版本号）、`lower_table`（**`@(init)` 启动时自动填充**）、`clamp_thread_count`、共享类型（`Progress`/`Match_Ctx`/`Match_Result`/`Match_Fn`/`Algorithm_Entry`/`Color_Mode`/`Run_Stats`）、`s2b` |
 | `lib/options.odin` | **纯数据**：`Options`（CLI 解析结果）、`Scan_Options`（一次扫描的选项）、`Walk_Options`（目录遍历选项）、`List_Mode`、`Parse_Outcome`。无行为代码 —— 解析在 `app/cli.odin`，编排在 `app/scan.odin`，遍历在 `app/walk.odin`（ADR 0007） |
 | `lib/task_pool.odin` | 扫描任务池：`Scan_Task` + Mutex 保护的动态数组，含 `init/push/pop/destroy`，供 worker 抢占 |
-| `lib/output_queue.odin` | 生产者/消费者输出队列：`Output_Item` + `Output_Queue`，Mutex + Cond，`done` 标志驱动消费者退出 |
+| `lib/output_queue.odin` | 生产者/消费者输出队列：`Output_Item` + `Output_Queue`，Mutex + Cond，`done` 标志驱动消费者退出。**内部是环形缓冲**（head/count 游标，O(1) 出队；ADR 0008） |
 | `lib/progress.odin` | 进度条操作（`\r` 原地刷新 + 限流，`--quiet` 或非传统输出模式时整体关闭）；类型定义在 `base.odin` |
 | `app/cli.odin` | `parse_args`（纯解析，不含退出策略；`file_list` **按需分配、调用方负责 `options_destroy`**）、`normalize_args`（`--k=v`、`-t8`、`-rn` 归一化）、短标志别名、`read_pattern_file`、`max_threads_for_machine`、`print_help`/`print_version` |
-| `search/matcher.odin` | `single_match` / `naive_match` / `bndm_match` / **`multi_match`（多模式）**，以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`。命中数组用 `context.allocator` 分配、**所有权归调用方**（见 ADR 0004） |
+| `search/matcher.odin` | `single_match`（SIMD 跳跃 + 密集段就地消费）/ `memchr_match`（首字节 SIMD 预筛 + 倒序验证）/ `naive_match`（兜底）/ `bndm_match`（2..16 入口，委托 `memchr_match`）/ **`multi_match`（多模式，首字节 256 位图预筛）**，以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`。命中数组用 `context.allocator` 分配、**所有权归调用方**（见 ADR 0004；算法分层见 ADR 0008） |
 | `app/walk.odin` | 目录遍历与 glob：`glob_match`/`walk_dir`/`walk_expand`/`walk_free`（递归、隐藏文件、glob、exclude 的选项类型是 `lib.Walk_Options`） |
 | `search/merge.odin` | `merge_ordered_matches`：多分片命中列表的多路有序归并（游标临时缓冲用后即释放） |
 | `search/slice_utils.odin` | 泛型切片工具：map / fold / filter / take / drop / sort |
-| `engine/worker.odin` | `worker_steal`（扫描线程）与 `output_thread`（唯一打印线程，含 JSON/行导向/`-o`/`-m` 分支）；**线程入口先归一化 `context`** |
-| `engine/io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加）、**`build_line_index`/`line_of`、`json_escape`、`print_hex_bytes`、`resolve_color`** |
+| `engine/worker.odin` | `worker_steal`（扫描线程）与 `output_thread`（唯一打印线程，含 JSON/行导向/`-o`/`-m` 分支）；**线程入口先归一化 `context`**；打印与 dump 均**攒批写出**（64 KiB 阈值）；silent 模式（`-q/-c/-l/-L` 且无 `-m`）跳过实时输出队列（ADR 0008） |
+| `engine/io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加、**攒批**）、**`build_line_index`（SIMD 单次遍历）/`line_of`、`json_escape`、`print_hex_bytes`、`resolve_color`** |
 | `app/scan.odin` | `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**）；选项类型 `lib.Scan_Options` 见 `lib/options.odin` |
 | `app/selftest.odin` | 内建自检 `run_tests`（`--test`），随二进制分发 |
 | `app/bench.odin` | 微基准 `run_bench`（`--bench`）：A 组算法吞吐 + B 组端到端线程伸缩 |
@@ -349,26 +349,26 @@ tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update /
   报告 1/2/4/8 线程的吞吐与相对加速比。单看 A 组只说明"算法有多快"，
   B 组才说明"多线程有没有用"。
 
-本机（10 逻辑核）实测输出示例：
+本机（10 逻辑核）实测输出示例（ADR 0008 之后）：
 
 ```
 -- A1. single pattern, case sensitive --
-  1B       single_match    1738.28 MB/s
-  4B       bndm_match      1484.14 MB/s
- 17B      naive_match     1362.71 MB/s
-128B      naive_match      956.05 MB/s
+  1B       single_match   22972.66 MB/s
+  4B       bndm_match     34118.05 MB/s
+ 17B      memchr_match   17129.15 MB/s
+128B      memchr_match    3709.47 MB/s
 -- A3. multi pattern (-e / -f) --
-  2 pat    multi_match      435.07 MB/s
-  4 pat    multi_match      219.87 MB/s
+  2 pat    multi_match     1502.47 MB/s
+  4 pat    multi_match     1219.02 MB/s
 -- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / 65536 B) --
-  1 thread(s)         1276.60 MB/s   1.00x
-  8 thread(s)         7600.05 MB/s   5.95x
+  1 thread(s)        64581.23 MB/s   1.00x
+  8 thread(s)        95808.38 MB/s   1.48x
 ```
 
-口径说明：B 组用**稀疏**数据（每 64 KiB 一处命中）是有意的 —— 出队是
-O(队列长度) 的整体左移，密集命中会让输出队列而不是扫描主导吞吐，
-那是另一个话题。A 组取"最快一轮"是因为别的负载与调度抖动只会让结果变慢，
-不会让它变快。
+口径说明：A 组取"最快一轮"是因为别的负载与调度抖动只会让结果变慢，
+不会让它变快。B 组的加速比**看起来变低了是正常现象**：匹配本身已经快到
+不再是瓶颈（1 线程就有 60+ GB/s），剩下的是内存带宽与线程同步 ——
+衡量多线程价值要看绝对吞吐，而不要只看倍数。
 
 ### 基线：129 用例全绿、0 内存泄漏
 
@@ -567,6 +567,13 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
   最底层只有 `lib` 一个包 —— 新增消费者不会再引出反向依赖。
   **对外行为零变化**：129 个用例（逐包 lib 19 / search 24 / engine 25 / app 61）
   与三套行为矩阵全部与整合前一致。
+- `ADR 0008`（`.ai-memory/adr/0008-mode-aware-algorithm-and-data-layout.md`）：
+  **按「模式长度」分层算法、按「操作模式」裁剪工作**。匹配侧统一用
+  `core:bytes.index_byte`（core 的 SIMD 实现）做首字节预筛，新增 `memchr_match`
+  （预筛 + 倒序验证）接管 2..4096 字节，多模式加首字节 256 位位图；操作侧
+  `-q/-c/-l/-L`（且无 `-m`）跳过输出队列、打印与 dump 攒批写出（64 KiB）；
+  数据结构侧 `Output_Queue` 改为环形缓冲（O(1) 出队）。
+  **对外行为零变化**：golden 矩阵与 dump 产物均逐字节一致，只有耗时变化。
 
 
 
@@ -592,8 +599,9 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
 3. 「契约」`--limit N` 只截断 pretty **汇总行**，且截断前会先丢弃前 2 条命中；
    `--count` 与 `--dump` 使用完整结果集。注意命中明细是由输出线程流式打印的，
    本身不受 `--limit` 限制。本项**未修改**（保留原语义）。
-4. 「契约」`bndm_match`（2..16 字节模式）当前直接委托 `naive_match`，未实现位并行算法，
-   因此 2..16 区间的性能与朴素扫描相同。
+4. 「契约」`bndm_match`（2..16 字节模式）**仍未实现**位并行算法：ADR 0008 之后它
+   委托 `memchr_match`（SIMD 预筛 + 倒序验证），**结果与朴素扫描完全一致**，
+   只是更快。17..4096 字节同样走 `memchr_match`；表外（>4096）回退 `naive_match`。
 5. 「变更 ADR 0002」`--dump-prefix P` 展开为 `P{sanitized(path)}.txt`：文件名中的路径分隔符
    （`/` `\`）与 Windows 保留字符（`: * ? " < > |`）被替换为 `_`，长度不变。
    因此不再需要预先创建与输入路径同构的目录层级（原行为会生成

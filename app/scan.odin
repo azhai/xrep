@@ -241,6 +241,9 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
 
     // ---- 4) 先启动输出线程（消费者），再启动 worker（生产者）----
     silent := o.quiet || o.only_count || o.list_mode != .None
+    // 明细不会被打印、且没有 -m 需要"流式前 N 条"时，worker 直接不入队：
+    // 稠密命中下每条一次加锁 + 唤醒是纯浪费（ADR 0008）。
+    no_stream := silent && o.max_count == 0
     out_args := engine.output_data{
         q = &out_q,
         file_data = file_data,
@@ -274,6 +277,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
             out_list = &match_lists,
             list_mu = &list_mu,
             progress = &prog,
+            no_stream = no_stream,
         }
         th := thread.create_and_start_with_data(&worker_args[i], engine.worker_steal)
         append(&workers, th)

@@ -37,17 +37,17 @@ test_progress :: proc() -> lib.Progress {
 
 @(test)
 test_select_matcher_boundaries :: proc(t: ^testing.T) {
-    // 区间边界逐一验证：1 → single；2..16 → bndm；17..64 → naive
+    // 区间边界逐一验证：1 → single；2..16 → bndm；17..4096 → memchr
     testing.expect(t, select_matcher(1) == single_match, "len=1 应选 single_match")
     testing.expect(t, select_matcher(2) == bndm_match, "len=2 应选 bndm_match")
     testing.expect(t, select_matcher(16) == bndm_match, "len=16 应选 bndm_match")
-    testing.expect(t, select_matcher(17) == naive_match, "len=17 应选 naive_match")
-    testing.expect(t, select_matcher(64) == naive_match, "len=64 应选 naive_match")
+    testing.expect(t, select_matcher(17) == memchr_match, "len=17 应选 memchr_match")
+    testing.expect(t, select_matcher(64) == memchr_match, "len=64 应选 memchr_match")
+    testing.expect(t, select_matcher(4096) == memchr_match, "len=4096 应选 memchr_match")
 
-    // 区间外：0 与 >64 都回退 naive_match
+    // 区间外：0 与 >4096 回退 naive_match
     testing.expect(t, select_matcher(0) == naive_match, "len=0 应回退 naive_match")
-    testing.expect(t, select_matcher(65) == naive_match, "len=65 应回退 naive_match")
-    testing.expect(t, select_matcher(4096) == naive_match, "超长模式应回退 naive_match")
+    testing.expect(t, select_matcher(4097) == naive_match, "超长模式应回退 naive_match")
 
     // 说明：alg_table 现为**编译期常量**，"空表回退"这一状态已不可能出现，
     // 故不再有对应断言；回退分支只在这里的区间外长度上被覆盖。

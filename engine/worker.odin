@@ -29,6 +29,8 @@ package engine
 
 import "base:runtime"
 import "core:fmt"
+import "core:os"
+import "core:strings"
 import "core:sync"
 import "xrep:lib"
 import "xrep:search"
@@ -43,6 +45,7 @@ worker_data :: struct {
     out_list:  ^[dynamic][]lib.Match_Result, // 共享：命中汇总（受 list_mu 保护）
     list_mu:   ^sync.Mutex,
     progress:  ^lib.Progress,
+    no_stream: bool, // 明细不会被打印时跳过输出队列（见下方说明）
 }
 
 // 扫描线程主体。
@@ -74,7 +77,13 @@ worker_steal :: proc(data: rawptr) {
         matches := matcher(scan_region, w.ctx, w.progress)
         for m in 0..<len(matches) {
             matches[m].offset += u64(task.start)
-            lib.output_queue_push(w.out_q, lib.Output_Item{offset = matches[m].offset, pat_len = matches[m].pat_len})
+            // --quiet / --count / -l / -L 时明细根本不打印，入队只是白付一次
+            // 加锁 + 唤醒；这些模式的命中数由上层归并结果得出（ADR 0008）。
+            // 仅在 `-m` 未设置时跳过：`-m` 的契约是"流式到达顺序的前 N 条"，
+            // 而流式顺序只有输出线程看得到。
+            if !w.no_stream {
+                lib.output_queue_push(w.out_q, lib.Output_Item{offset = matches[m].offset, pat_len = matches[m].pat_len})
+            }
         }
         sync.mutex_lock(w.list_mu)
         append(w.out_list, matches)
@@ -111,10 +120,29 @@ output_data :: struct {
 // 取的是"流式到达顺序"的前 N 条 —— 多分片时任务完成顺序可能与偏移顺序不同，
 // 因此上限截取的是"最先算出来的 N 条"，而不是"偏移最小的 N 条"。
 // 汇总/落盘路径（scan_file）另行把归并结果截断到 N，两条路径的条数一致。
+// 打印阈值：攒到这么多字节才 write 一次 stdout。
+// 每条命中一次 `fmt.printf` 就是一次 write 系统调用，稠密命中（百万条）下
+// syscall 是主要成本；攒批后输出文本逐字节不变，只是 write 次数变少。
+OUT_FLUSH_BYTES :: 64 * 1024
+
 output_thread :: proc(data: rawptr) {
     // 同 worker_steal：线程入口先归一化上下文，避免继承测试运行器的追踪分配器。
     context = runtime.default_context()
     w := cast(^output_data)data
+
+    sb: strings.Builder
+    strings.builder_init(&sb)
+    // 收敛路径只有一处（队列空且 done），但**提前 return / 崩溃**都会漏 flush。
+    // 这里用 defer 兜底：先写出残留、再销毁 builder。
+    // 注意 defer 必须写在函数体顶层 —— Odin 的 defer 是块作用域，
+    // 写在循环或 if 里会在该块结束时就把缓冲刷出去。
+    defer {
+        if len(sb.buf) > 0 {
+            os.write(os.stdout, sb.buf[:])
+        }
+        strings.builder_destroy(&sb)
+    }
+
     for {
         ok, item := lib.output_queue_pop(w.q)
         if !ok {
@@ -143,14 +171,16 @@ output_thread :: proc(data: rawptr) {
         if w.json {
             esc := json_escape(w.path_label)
             if w.only_matching {
-                fmt.printf("{{\"file\":\"%s\",\"line\":%d,\"offset\":%d,\"len\":%d,\"match\":\"", esc, line, item.offset, plen)
-                print_hex_bytes(w.file_data, item.offset, plen)
-                // fmt.print 不做格式解析，字面量直接输出（与 printf 的 {{ }} 规则不同）。
-                fmt.print("\"}\n")
+                fmt.sbprintf(&sb, "{{\"file\":\"%s\",\"line\":%d,\"offset\":%d,\"len\":%d,\"match\":\"", esc, line, item.offset, plen)
+                print_hex_bytes(w.file_data, item.offset, plen, &sb)
+                // 字面量引号与换行：fmt 不解析 `{}`，但这里处在 printf 之外，
+                // 直接写字符串即可（与旧代码 fmt.print 的语义一致）。
+                strings.write_string(&sb, "\"}\n")
             } else {
-                fmt.printf("{{\"file\":\"%s\",\"line\":%d,\"offset\":%d,\"len\":%d}}\n", esc, line, item.offset, plen)
+                fmt.sbprintf(&sb, "{{\"file\":\"%s\",\"line\":%d,\"offset\":%d,\"len\":%d}}\n", esc, line, item.offset, plen)
             }
             delete(esc)
+            maybe_flush(&sb)
             continue
         }
 
@@ -161,28 +191,38 @@ output_thread :: proc(data: rawptr) {
         //   其余                   → 沿用历史 `match offset: N`（逐字节兼容）
         if w.show_path || w.line_numbers {
             if w.show_path {
-                fmt.printf("%s:", w.path_label)
+                fmt.sbprintf(&sb, "%s:", w.path_label)
             }
-            fmt.printf("%d:", line)
+            fmt.sbprintf(&sb, "%d:", line)
             if w.offset_hex {
-                fmt.printf("0x%x\n", item.offset)
+                fmt.sbprintf(&sb, "0x%x\n", item.offset)
             } else {
-                fmt.printf("%d\n", item.offset)
+                fmt.sbprintf(&sb, "%d\n", item.offset)
             }
         } else {
             if w.offset_hex {
-                fmt.printf("match offset: 0x%x\n", item.offset)
+                fmt.sbprintf(&sb, "match offset: 0x%x\n", item.offset)
             } else {
-                fmt.printf("match offset: %d\n", item.offset)
+                fmt.sbprintf(&sb, "match offset: %d\n", item.offset)
             }
         }
         if w.only_matching {
-            fmt.print("  matched hex: ")
-            print_hex_bytes(w.file_data, item.offset, plen)
-            fmt.println()
+            strings.write_string(&sb, "  matched hex: ")
+            print_hex_bytes(w.file_data, item.offset, plen, &sb)
+            strings.write_string(&sb, "\n")
         }
         if w.ctx > 0 {
-            print_context(w.file_data, item.offset, plen, w.ctx, w.use_color)
+            print_context(w.file_data, item.offset, plen, w.ctx, w.use_color, &sb)
         }
+        maybe_flush(&sb)
     }
+}
+
+// 攒批写出：达到阈值才真正写一次 stdout。
+maybe_flush :: proc(sb: ^strings.Builder) {
+    if len(sb.buf) < OUT_FLUSH_BYTES {
+        return
+    }
+    os.write(os.stdout, sb.buf[:])
+    strings.builder_reset(sb)
 }
