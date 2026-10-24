@@ -197,11 +197,11 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     }
 
     // ---- 0) 行号表（仅在需要时构建；见 line_index_needed）----
-    line_index: []u64
+    line_index: engine.Line_Index
     if line_index_needed(o) {
         line_index = engine.build_line_index(file_data)
     }
-    defer if line_index != nil { delete(line_index) }
+    defer engine.line_index_destroy(&line_index)
 
     // ---- 1) 切分任务：每个任务 TASK_CHUNK_SIZE 字节，最后一块可能不足 ----
     tp: lib.Task_Pool

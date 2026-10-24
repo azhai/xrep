@@ -59,6 +59,9 @@ alg_name :: proc(m: lib.Match_Fn) -> string {
     if m == search.multi_match {
         return "multi_match"
     }
+    if m == search.multi_ac_match {
+        return "multi_ac"
+    }
     return "?"
 }
 
@@ -167,15 +170,67 @@ run_bench :: proc() {
     // ---- A3. 多模式：命中集合随模式数线性增长 ----
     fmt.println("\n-- A3. multi pattern (-e / -f) --")
     multi1 := lib.Match_Ctx{pattern = lib.s2b("test"), extra = [][]u8{data[6000:6004]}}
-    bench_ctx("2 pat", data, multi1, &p)
+    bench_case("2 pat", search.multi_match, data, multi1, &p)
     multi3 := lib.Match_Ctx{
         pattern = lib.s2b("test"),
         extra   = [][]u8{data[6000:6004], data[7000:7004], data[8000:8004]},
     }
-    bench_ctx("4 pat", data, multi3, &p)
+    bench_case("4 pat", search.multi_match, data, multi3, &p)
+    bench_case("4 pat", search.multi_ac_match, data, multi3, &p)
 
-    // ---- B. 端到端线程伸缩 ----
-    fmt.printf("\n-- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / %d B) --\n", BENCH_SPARSE_HIT_BYTES)
+    // 模式数更多时的衰减曲线：multi_match 的代价是 O(位置数 × 模式数)，
+    // Aho-Corasick 是 O(位置数)。两组数字的交叉点就是启用 AC 的阈值依据。
+    // 注意步长取 4（不是 16）：data 是 256 周期的，步长 16 会让 k 与 k+16 撞成
+    // 同一个四字节窗口 → 64 个"模式"其实只有 16 个不同模式、命中数翻四倍，
+    // 测出来的是重复模式的重复发射，不是"模式变多"的代价。
+    counts := []int{8, 16, 32, 64}
+    for cnt in counts {
+        extra := make([][]u8, cnt - 1)
+        defer delete(extra)
+        for k in 0..<cnt - 1 {
+            extra[k] = data[6000 + k * 4:6000 + k * 4 + 4]
+        }
+        ctx := lib.Match_Ctx{pattern = lib.s2b("test"), extra = extra}
+        label := fmt.aprintf("%d pat", cnt)
+        defer delete(label)
+        bench_case(label, search.multi_match, data, ctx, &p)
+        bench_case(label, search.multi_ac_match, data, ctx, &p)
+    }
+
+    // ---- A4. 算法对拍：SIMD 预筛 vs 位并行 BNDM ----
+    // 同一份数据、同一个模式，分别跑两种实现 —— 用来回答"谁更快、在什么分布上"。
+    // 三组数据刻意覆盖三种极端：
+    //   uniform — 首字节频率 1/256，预筛几乎不退化（SIMD 的主场）
+    //   dense   — 模式隔一个字节就命中一次，预筛与结果数组都不轻松
+    //   zeros   — 首字节占绝大多数（预筛逐字节"命中"），但**末字节**稀有
+    // 这一组不走 select_matcher_for，而是显式指定算法，因此可以直接对拍。
+    fmt.println("\n-- A4. memchr (SIMD) vs bndm (bit-parallel), 16 MiB each --")
+    a4 := mem.Megabyte * 16
+    a4_uniform := make([]u8, a4)
+    defer delete(a4_uniform)
+    for i in 0..<len(a4_uniform) {
+        a4_uniform[i] = u8(i % 256)
+    }
+    copy(a4_uniform[1000:1004], lib.s2b("test"))
+    a4_dense := make([]u8, a4)
+    defer delete(a4_dense)
+    for i in 0..<len(a4_dense) {
+        a4_dense[i] = 'a'
+    }
+    a4_zeros := make([]u8, a4)
+    defer delete(a4_zeros) // make 已零初始化：全 0x00
+    bench_case("uniform", search.memchr_match, a4_uniform, lib.Match_Ctx{pattern = lib.s2b("test")}, &p)
+    bench_case("uniform", search.bndm_match, a4_uniform, lib.Match_Ctx{pattern = lib.s2b("test")}, &p)
+    bench_case("dense", search.memchr_match, a4_dense, lib.Match_Ctx{pattern = lib.s2b("aa")}, &p)
+    bench_case("dense", search.bndm_match, a4_dense, lib.Match_Ctx{pattern = lib.s2b("aa")}, &p)
+    bench_case("zeros", search.memchr_match, a4_zeros, lib.Match_Ctx{pattern = []u8{0x00, 0x01}}, &p)
+    bench_case("zeros", search.bndm_match, a4_zeros, lib.Match_Ctx{pattern = []u8{0x00, 0x01}}, &p)
+
+    // ---- A5. 多模式的**纯扫描成本**（稀疏数据，几乎无命中）----
+    // A3 的周期性数据里每个模式每 256 字节就命中一次，测出来的其实是
+    // "扫描 + 命中发射"的合成值。这里换成全 0xFF（模式是 0..255 的周期序列，
+    // 一次都不命中），于是数字只剩自动机/位图的每字节成本，两者的差异才看得清。
+    fmt.printf("\n-- A5. multi pattern, per-byte scan cost (no hits, %d MiB) --\n", BENCH_SPARSE_SIZE / mem.Megabyte)
     sparse := make([]u8, BENCH_SPARSE_SIZE)
     defer delete(sparse)
     for i in 0..<len(sparse) {
@@ -184,6 +239,21 @@ run_bench :: proc() {
     for off := 0; off + 4 <= len(sparse); off += BENCH_SPARSE_HIT_BYTES {
         copy(sparse[off:off + 4], lib.s2b("test"))
     }
+    scan_counts := []int{4, 16, 64}
+    for cnt in scan_counts {
+        extra := make([][]u8, cnt - 1)
+        defer delete(extra)
+        for k in 0..<cnt - 1 {
+            extra[k] = data[6000 + k * 4:6000 + k * 4 + 4]
+        }
+        ctx := lib.Match_Ctx{pattern = lib.s2b("test"), extra = extra}
+        label := fmt.aprintf("%d pat", cnt)
+        defer delete(label)
+        bench_case(label, search.multi_match, sparse, ctx, &p)
+        bench_case(label, search.multi_ac_match, sparse, ctx, &p)
+    }
+
+    fmt.printf("\n-- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / %d B) --\n", BENCH_SPARSE_HIT_BYTES)
     bench_scan_scaling(sparse, lib.Match_Ctx{pattern = lib.s2b("test")}, "bench")
 
     fmt.println("\n==== bench done ====")

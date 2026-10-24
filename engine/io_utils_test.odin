@@ -253,12 +253,13 @@ test_dump_matches_append_mode :: proc(t: ^testing.T) {
 test_build_line_index_and_line_of :: proc(t: ^testing.T) {
     data := lib.s2b("abc\ndef\n\nxyz")
     idx := build_line_index(data)
-    defer delete(idx)
-    // 换行位于偏移 3 / 7 / 8
-    testing.expect_value(t, len(idx), 3)
-    testing.expect_value(t, idx[0], u64(3))
-    testing.expect_value(t, idx[1], u64(7))
-    testing.expect_value(t, idx[2], u64(8))
+    defer line_index_destroy(&idx)
+    // 换行位于偏移 3 / 7 / 8；换行数远小于上限，因此是全量表（stride = 1）
+    testing.expect_value(t, idx.stride, u64(1))
+    testing.expect_value(t, len(idx.marks), 3)
+    testing.expect_value(t, idx.marks[0], u64(3))
+    testing.expect_value(t, idx.marks[1], u64(7))
+    testing.expect_value(t, idx.marks[2], u64(8))
     // 行号 1-based：换行符本身仍属"上一行"
     testing.expect_value(t, line_of(idx, 0), u64(1)) // 'a'
     testing.expect_value(t, line_of(idx, 3), u64(1)) // '\n' 本身
@@ -272,24 +273,78 @@ test_build_line_index_and_line_of :: proc(t: ^testing.T) {
 test_build_line_index_edges :: proc(t: ^testing.T) {
     // 无换行 → 空表，任何偏移都是第 1 行
     idx := build_line_index(lib.s2b("no newline here"))
-    defer delete(idx)
-    testing.expect_value(t, len(idx), 0)
+    defer line_index_destroy(&idx)
+    testing.expect_value(t, len(idx.marks), 0)
     testing.expect_value(t, line_of(idx, 0), u64(1))
     testing.expect_value(t, line_of(idx, 999), u64(1))
 
     // 空数据
     empty := build_line_index([]u8{})
-    defer delete(empty)
-    testing.expect_value(t, len(empty), 0)
+    defer line_index_destroy(&empty)
+    testing.expect_value(t, len(empty.marks), 0)
     testing.expect_value(t, line_of(empty, 0), u64(1))
 
     // 纯换行：n 个 '\n' → 最后一行为空行
     nl := build_line_index(lib.s2b("\n\n"))
-    defer delete(nl)
-    testing.expect_value(t, len(nl), 2)
+    defer line_index_destroy(&nl)
+    testing.expect_value(t, len(nl.marks), 2)
     testing.expect_value(t, line_of(nl, 0), u64(1))
     testing.expect_value(t, line_of(nl, 1), u64(2))
     testing.expect_value(t, line_of(nl, 2), u64(3))
+}
+
+// 抽稀路径（stride > 1）必须与"逐个偏移数换行"的全量参照逐点一致。
+// 这是稀疏索引唯一的正确性依据：块内回扫的边界（marks[j] 含不含、off-by-one）
+// 错了，行号就会整体偏移，而普通的短文件测试正好落在 stride=1 的死角里。
+@(test)
+test_line_index_sparse_matches_dense :: proc(t: ^testing.T) {
+    // 换行数远超 LINE_INDEX_MAX_MARKS，必然触发多轮抽稀；
+    // 行长取 1..7 的不等长，避免"定长行"掩盖块内回扫的边界错误。
+    buf := make([dynamic]u8, 0, 1 << 21)
+    defer delete(buf)
+    for i in 0..<400000 {
+        n := 1 + i % 7
+        for _ in 0..<n {
+            append(&buf, u8('a' + i % 26))
+        }
+        append(&buf, '\n')
+    }
+    data := buf[:]
+    li := build_line_index(data)
+    defer line_index_destroy(&li)
+
+    testing.expect(t, li.stride > 1, "换行数超过上限应触发抽稀")
+    if len(li.marks) > LINE_INDEX_MAX_MARKS + 1 {
+        testing.expectf(t, false, "标记数应有界，实际 %d", len(li.marks))
+    }
+
+    count := u64(0)
+    hint: Line_Hint
+    for o in 0..<len(data) {
+        // 绝大多数查询走"提示命中"的快路径（命中按偏移递增到达时的真实形态），
+        // 每 5000 个探一次不带提示的慢路径，两条路径都对着同一个参照数。
+        got: u64
+        if o % 5000 == 0 {
+            got = line_of(li, u64(o))
+        } else {
+            got = line_of(li, u64(o), &hint)
+        }
+        if got != count + 1 {
+            testing.expectf(t, false, "偏移 %d：期望第 %d 行，实际 %d", o, count + 1, got)
+            return
+        }
+        if data[o] == '\n' {
+            count += 1
+        }
+    }
+    // 乱序访问（提示必然跨块失效）也不能错
+    hint = {}
+    for o := len(data) - 1; o > 0; o -= 4093 {
+        want := line_of(li, u64(o))
+        testing.expect_value(t, line_of(li, u64(o), &hint), want)
+    }
+    // 越界偏移按数据末尾处理（与旧的全量表语义一致）
+    testing.expect_value(t, line_of(li, u64(len(data) + 1000)), count + 1)
 }
 
 // ---------------------------------------------------------------------------

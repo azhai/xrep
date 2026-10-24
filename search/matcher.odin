@@ -162,13 +162,94 @@ naive_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> 
     return results[:]
 }
 
-// 中短模式（2..16 字节）入口。
+// ---------------------------------------------------------------------------
+// 位并行 BNDM（Backward Nondeterministic DAWG Matching）
+// ---------------------------------------------------------------------------
+
+// BNDM 用 u64 位掩码承载"模式前缀 vs 窗口后缀"的匹配状态，因此模式长度
+// 上限就是机器字长 64 字节（超出的场合见下方回退分支）。
+BNDM_MAX_LEN :: 64
+
+// 位并行 BNDM：**从窗口尾部向前**读，用一次移位 + 一次掩码同时更新所有
+// 可能的对齐位置，并在读完之前就确定安全的跳跃距离。
 //
-// 说明：此处**仍未实现** BNDM 位并行算法，而是委托下面的 memchr_match
-//       （SIMD 预筛 + 倒序验证），与朴素扫描的结果完全一致、只是更快。
-//       若后续实现真正的位并行版本，只需替换本函数体，选择表与调用方无需改动。
+// 不变量（第 j 轮与 B[data[pos+j]] 相交之后）：
+//   D 的第 r 位为 1  ⟺  pat[r .. r+(m-1-j)] == data[pos+j .. pos+m-1]
+// 于是：
+//   * 第 0 位为 1 ⟺ "窗口后缀 == 模式前缀"，即 pos+j 是一个合法的候选起点；
+//   * j == 0 且第 0 位为 1 ⟺ 完整命中。
+// 递推只需 `D = (D >> 1) & B[c]`：D 的第 r 位由上一轮第 r+1 位"右移"得来，
+// 正好对应"模式位置 r 去对齐更早的那个字节"。
+//
+// 跳跃：反向扫描过程中 j 递减，每当第 0 位为 1 就记下 `last = j`；最终留下的是
+// **最小的**合法 j，也就是不会漏掉任何候选起点的最保守位移。整轮都没记到就
+// 位移 m（窗口内没有任何前缀-后缀重合，跳过整个窗口是安全的）。
+//
+// 与 naive_match 的结果逐条一致：候选起点逐 1 推进，重叠命中不丢。
 bndm_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> []lib.Match_Result {
-    return memchr_match(data, ctx, progress)
+    pat := ctx.pattern
+    m := uint(len(pat))
+    // 位掩码装不下超长模式：交给通用实现（结果一致，只是慢）。
+    if m > BNDM_MAX_LEN {
+        return naive_match(data, ctx, progress)
+    }
+    results := make([dynamic]lib.Match_Result, 0, MATCH_INITIAL_CAP)
+    n := uint(len(data))
+    // 与 naive/memchr 一致：空模式、模式比数据长都无命中，但**照样上报扫描量**。
+    if m == 0 || m > n {
+        lib.progress_add(progress, u64(len(data)))
+        return results[:]
+    }
+
+    // 预处理：B[c] 的第 j 位为 1 ⟺ pat[j] == c（大小写不敏感时双方都取小写）。
+    B: [256]u64
+    if ctx.case_insensitive {
+        for j := uint(0); j < m; j += 1 {
+            B[lib.lower_table[pat[j]]] |= 1 << j
+        }
+    } else {
+        for j := uint(0); j < m; j += 1 {
+            B[pat[j]] |= 1 << j
+        }
+    }
+    // 低 m 位全 1。m == 64 时 `1 << 64` 是未定义行为，必须单独处理。
+    full: u64 = ~u64(0)
+    if m < 64 {
+        full = (u64(1) << m) - 1
+    }
+
+    limit := n - m + 1
+    pos := uint(0)
+    for pos < limit {
+        j := m - 1
+        last := m
+        D := full
+        for {
+            c := data[pos + j]
+            if ctx.case_insensitive {
+                c = lib.lower_table[c]
+            }
+            D &= B[c]
+            if D == 0 {
+                break
+            }
+            if D & 1 == 1 {
+                if j == 0 {
+                    append(&results, lib.Match_Result{offset = u64(pos), pat_len = u32(m)})
+                } else {
+                    last = j
+                }
+            }
+            if j == 0 {
+                break
+            }
+            D >>= 1
+            j -= 1
+        }
+        pos += last
+    }
+    lib.progress_add(progress, u64(len(data)))
+    return results[:]
 }
 
 // 多字节模式的通用实现：**首字节 SIMD 预筛 + 倒序验证**。
@@ -182,6 +263,21 @@ bndm_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> [
 //   - 只在 [0, n-m] 范围内搜首字节，天然不会越界读；
 //   - 空模式与"模式比数据长"都与朴素实现一样返回空，且**照样上报扫描字节数**
 //     （进度条依赖它，测试有断言）。
+//
+// 退化保护（ADR 0009）：预筛的代价正比于"首字节出现的频率"。若首字节在数据里
+// 极常见（典型如二进制数据里搜 0x00 开头的模式），SIMD 每个字节都"命中"，
+// 预筛就退化成逐字节验证 —— 此时切换到 BNDM（它先读**末字节**，可能一次就
+// 否掉整个窗口）。判定用"候选密度"而不是预先采样，因此不依赖样本代表性。
+//   ADAPTIVE_MIN_SCAN — 至少扫过这么多字节才允许切换（避免小分片误判）
+//   ADAPTIVE_MAX_DENSITY — 候选数 / 已扫字节 超过 1/这个值 即判为退化
+// 阈值取 1/4 是量出来的（`xrep --bench` 的 A4 组）：
+//   uniform（首字节 1/256）memchr 34.6 GB/s vs bndm 5.1 GB/s —— 不该切；
+//   dense  （"aa" 扫全 'a'）memchr 87 MB/s vs bndm 154 MB/s —— 该切；
+//   zeros  （首字节 100%）  两者都是 758 MB/s —— 切不切一样。
+// dense.bin（'t' 每 8 字节一次 = 1/8）落在阈值下方，保持不切。
+ADAPTIVE_MIN_SCAN :: 4096
+ADAPTIVE_MAX_DENSITY :: 4
+
 memchr_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> []lib.Match_Result {
     results := make([dynamic]lib.Match_Result, 0, MATCH_INITIAL_CAP)
     pat := ctx.pattern
@@ -205,12 +301,32 @@ memchr_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) ->
     // 候选位置的上界：at + m <= n。搜索区间到 n-m+1 为止（含）。
     search_end := n - m + 1
     at := uint(0)
+    scanned := uint(0) // 已扫过的字节数（切换判定用）
+    cands := uint(0) // 已遇到的候选数
     for at < search_end {
         idx := find_byte(data[at:search_end], first, alt, two)
         if idx < 0 {
             break
         }
         at += uint(idx)
+        // ---- 退化判定：只在 BNDM 扛得住的模式长度下启用 ----
+        if m <= BNDM_MAX_LEN {
+            scanned += uint(idx) + 1
+            cands += 1
+            if scanned >= ADAPTIVE_MIN_SCAN && cands * ADAPTIVE_MAX_DENSITY > scanned {
+                // 把剩余区间整体交给 BNDM，并把偏移还原成文件绝对位置。
+                // 此刻 at 处的候选**尚未验证**，因此不会出现重复上报。
+                // 零值 Progress 的 enabled 为 false，progress_add 会直接返回，
+                // 不会重复累加扫描量。
+                tail_prog: lib.Progress
+                tail := bndm_match(data[at:], ctx, &tail_prog)
+                for h in tail {
+                    append(&results, lib.Match_Result{offset = h.offset + u64(at), pat_len = h.pat_len})
+                }
+                delete(tail)
+                break
+            }
+        }
         if match_rest(data, pat, at, m, ctx.case_insensitive) {
             append(&results, lib.Match_Result{offset = u64(at), pat_len = u32(m)})
         }
@@ -303,7 +419,10 @@ multi_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> 
 // 表里放的是匹配函数指针，属于"能力缝隙"：换算法只改这里一行。
 alg_table := [?]lib.Algorithm_Entry{
     {min_len = 1, max_len = 1, matcher = single_match},
-    {min_len = 2, max_len = 16, matcher = bndm_match},
+    // 2..16 走 SIMD 预筛；首字节过于稠密时它会自动切换到位并行 BNDM
+    // （见 memchr_match 的退化保护）。纯 BNDM 在这台有 AVX2 的机器上是
+    // 预筛的**负优化**（实测见 ADR 0009），所以它不作为默认入口。
+    {min_len = 2, max_len = 16, matcher = memchr_match},
     // 长模式同样吃 SIMD 预筛的红利（首字节在稀疏数据里很稀有），
     // 因此 17..4096 一并交给 memchr_match，而不是退回朴素扫描。
     {min_len = 17, max_len = 4096, matcher = memchr_match},
@@ -323,8 +442,13 @@ select_matcher :: proc(pat_len: uint) -> lib.Match_Fn {
 // 按整个匹配上下文选择匹配函数（worker 的入口）。
 // 多模式（-e / -f）统一交给 multi_match；单模式仍走 alg_table 的长度分派，
 // 因此**单模式路径的算法与性能与加多模式之前完全一致**。
+// 多模式（-e / -f）统一交给 multi_match；模式数多到一定程度（见 ac.odin 的
+// ac_worth_it）改走 Aho-Corasick 自动机 —— 代价从 O(n × 模式数) 变成 O(n)。
 select_matcher_for :: proc(ctx: lib.Match_Ctx) -> lib.Match_Fn {
     if len(ctx.extra) > 0 {
+        if ac_worth_it(ctx) {
+            return multi_ac_match
+        }
         return multi_match
     }
     return select_matcher(uint(len(ctx.pattern)))

@@ -6,7 +6,8 @@ package search
 // 覆盖：
 //   * select_matcher 的长度区间边界（1 / 2 / 16 / 17 / 64 / 65 / 0）与空表回退
 //   * single_match / naive_match 的正确性（重叠命中、大小写、空数据、模式超长）
-//   * bndm_match 与 naive_match 的委托一致性
+//   * bndm_match：真正的位并行 BNDM（u64 掩码 + 反向窗口扫描），与 naive 逐条一致
+//   * memchr_match 的退化保护：首字节极稠密时中途切到 BNDM，拼接结果仍与 naive 一致
 //   * 三种算法在同一输入上的结果一致性
 //   * **差分测试**：把各算法与一个"独立参考实现"（core:strings 的 index）
 //     在确定性伪随机数据上逐条比对 —— 覆盖 8 种模式 × 大小写两态
@@ -37,10 +38,10 @@ test_progress :: proc() -> lib.Progress {
 
 @(test)
 test_select_matcher_boundaries :: proc(t: ^testing.T) {
-    // 区间边界逐一验证：1 → single；2..16 → bndm；17..4096 → memchr
+    // 区间边界逐一验证：1 → single；2..4096 → memchr
     testing.expect(t, select_matcher(1) == single_match, "len=1 应选 single_match")
-    testing.expect(t, select_matcher(2) == bndm_match, "len=2 应选 bndm_match")
-    testing.expect(t, select_matcher(16) == bndm_match, "len=16 应选 bndm_match")
+    testing.expect(t, select_matcher(2) == memchr_match, "len=2 应选 memchr_match")
+    testing.expect(t, select_matcher(16) == memchr_match, "len=16 应选 memchr_match")
     testing.expect(t, select_matcher(17) == memchr_match, "len=17 应选 memchr_match")
     testing.expect(t, select_matcher(64) == memchr_match, "len=64 应选 memchr_match")
     testing.expect(t, select_matcher(4096) == memchr_match, "len=4096 应选 memchr_match")
@@ -205,17 +206,169 @@ test_naive_match :: proc(t: ^testing.T) {
 test_bndm_matches_naive :: proc(t: ^testing.T) {
     p := test_progress()
 
-    // bndm_match 当前委托 naive_match，两者结果必须逐项一致（含偏移顺序）。
-    data := lib.s2b("abcabcabXabc")
-    ctx := lib.Match_Ctx{pattern = lib.s2b("abc"), case_insensitive = false}
-    a := bndm_match(data, ctx, &p)
-    defer delete(a)  // 返回值归调用方所有（堆分配，见 matcher.odin）
-    testing.expect_value(t, len(a), 3)
-    b := naive_match(data, ctx, &p)
-    defer delete(b)  // 返回值归调用方所有（堆分配，见 matcher.odin）
-    testing.expect_value(t, len(b), 3)
-    for i in 0..<len(a) {
-        testing.expect_value(t, a[i].offset, b[i].offset)
+    // ---- 1) 手工用例：覆盖"教科书边界" ----
+    // 重叠命中（"aa" 在 "aaa" 里是 2 条）、前缀-后缀重合（"aba" 在 "ababa"）
+    hand := []struct {
+        data: string,
+        pat:  string,
+        want: int,
+    }{
+        {"aaa", "aa", 2},
+        {"ababa", "aba", 2},
+        {"abcabc", "abc", 2},
+        {"abcabcabXabc", "abc", 3},
+        {"aaaa", "aaaa", 1},
+        {"", "ab", 0},
+        {"ab", "abc", 0}, // 模式比数据长
+        {"abc", "", 0}, // 空模式
+        {"aaaa", "b", 0},
+        {"xxabcxx", "abc", 1},
+        {"aaaaaa", "aaa", 4}, // 全重叠：0/1/2/3
+    }
+    ci_cases := []bool{false, true}
+    for c, case_no in hand {
+        for ci_on in ci_cases {
+            ctx := lib.Match_Ctx{pattern = lib.s2b(c.pat), case_insensitive = ci_on}
+            got := bndm_match(lib.s2b(c.data), ctx, &p)
+            defer delete(got)
+            ref := naive_match(lib.s2b(c.data), ctx, &p)
+            defer delete(ref)
+            testing.expectf(
+                t,
+                len(got) == len(ref) && len(ref) == c.want,
+                "data=%q pat=%q ci=%v: bndm=%d naive=%d want=%d",
+                c.data,
+                c.pat,
+                ci_on,
+                len(got),
+                len(ref),
+                c.want,
+            )
+            for i in 0..<min(len(got), len(ref)) {
+                testing.expectf(
+                    t,
+                    got[i].offset == ref[i].offset && got[i].pat_len == ref[i].pat_len,
+                    "case %d pat=%q ci=%v 第 %d 条: bndm=%d naive=%d",
+                    case_no,
+                    c.pat,
+                    ci_on,
+                    i,
+                    got[i].offset,
+                    ref[i].offset,
+                )
+            }
+        }
+    }
+
+    // ---- 2) 差分测试：模式长度 1..70 × 大小写两态 × 小字母表随机数据 ----
+    // 70 > BNDM_MAX_LEN(64)，顺便覆盖"超长模式回退 naive"那条分支。
+    rng: u32 = 0x13579BDF
+    data := make([]u8, 2048)
+    defer delete(data)
+    for i in 0..<len(data) {
+        rng = rng * 1664525 + 1013904223
+        data[i] = u8('a' + (rng >> 16) % 4) // 字母表只有 a..d → 命中密集
+    }
+    // 埋几个跨大小写与末尾的实例
+    copy(data[100:106], lib.s2b("AbCdab"))
+    copy(data[2044:2048], lib.s2b("abcd"))
+
+    pat_buf := make([]u8, 70)
+    defer delete(pat_buf)
+    for m in 1..=70 {
+        // 模式内容也取自同一字母表（含大写，便于验证 -i 路径）
+        for j in 0..<m {
+            rng = rng * 1664525 + 1013904223
+            r := (rng >> 16) % 6
+            pat_buf[j] = 'a' + u8(r % 4)
+            if r == 4 {
+                pat_buf[j] = 'A' + u8((rng >> 8) % 4)
+            }
+        }
+        pat := pat_buf[:m]
+        for ci_on in ci_cases {
+            ctx := lib.Match_Ctx{pattern = pat, case_insensitive = ci_on}
+            got := bndm_match(data, ctx, &p)
+            defer delete(got)
+            ref := naive_match(data, ctx, &p)
+            defer delete(ref)
+            testing.expectf(t, len(got) == len(ref), "m=%d ci=%v: bndm=%d naive=%d", m, ci_on, len(got), len(ref))
+            for i in 0..<min(len(got), len(ref)) {
+                testing.expectf(
+                    t,
+                    got[i].offset == ref[i].offset && got[i].pat_len == ref[i].pat_len,
+                    "m=%d ci=%v 第 %d 条: bndm=(%d,%d) naive=(%d,%d)",
+                    m,
+                    ci_on,
+                    i,
+                    got[i].offset,
+                    got[i].pat_len,
+                    ref[i].offset,
+                    ref[i].pat_len,
+                )
+            }
+        }
+    }
+}
+
+@(test)
+test_bndm_reports_scanned_bytes :: proc(t: ^testing.T) {
+    // 与其它算法同一契约：返回前 progress_add(len(data))。
+    p: lib.Progress
+    lib.progress_init(&p, 100, false, true)
+    r := bndm_match(lib.s2b("abcabc"), lib.Match_Ctx{pattern = lib.s2b("abc")}, &p)
+    defer delete(r)
+    testing.expect_value(t, p.scanned, u64(6))
+    // 超长模式走 naive 回退时也必须上报（回退分支别漏了进度）
+    long_pat := make([]u8, 65)
+    defer delete(long_pat)
+    for i in 0..<65 {
+        long_pat[i] = 'a'
+    }
+    r2 := bndm_match(lib.s2b("aaa"), lib.Match_Ctx{pattern = long_pat}, &p)
+    defer delete(r2)
+    testing.expect_value(t, len(r2), 0)
+    testing.expect_value(t, p.scanned, u64(9))
+}
+
+@(test)
+test_memchr_degenerate_switch_matches_naive :: proc(t: ^testing.T) {
+    // 退化保护：首字节极常见时 memchr_match 会中途切换到位并行 BNDM，
+    // 切换前后拼起来的结果必须与朴素扫描逐条一致。
+    // 数据里 0x00 占绝大多数（候选密度 ~100%），远超 ADAPTIVE_MAX_DENSITY。
+    p := test_progress()
+    N :: 20000
+    data := make([]u8, N)
+    defer delete(data)
+    rng: u32 = 0x5A5A5A5A
+    for i in 0..<N {
+        rng = rng * 1664525 + 1013904223
+        if (rng >> 16) % 64 == 0 {
+            data[i] = 0x01 // 稀疏的"稀有字节"
+        } else {
+            data[i] = 0x00
+        }
+    }
+    // 埋几处真实命中（含数据末尾附近，覆盖"切换发生在尾部"的情形）
+    copy(data[5000:5004], []u8{0x00, 0x01, 0x00, 0x00})
+    copy(data[N - 6:N - 2], []u8{0x00, 0x01, 0x00, 0x00})
+
+    pats := [][]u8{
+        []u8{0x00, 0x01}, // 首字节极常见、末字节稀有 → 预筛必退化
+        []u8{0x00, 0x01, 0x00, 0x00},
+        []u8{0x00, 0x00}, // 首字节与末字节都常见
+        []u8{0x01, 0x00}, // 首字节稀有 → 不该切换
+    }
+    for pat in pats {
+        ctx := lib.Match_Ctx{pattern = pat, case_insensitive = false}
+        got := memchr_match(data, ctx, &p)
+        defer delete(got)
+        ref := naive_match(data, ctx, &p)
+        defer delete(ref)
+        testing.expectf(t, len(got) == len(ref), "pat=%v: memchr=%d naive=%d", pat, len(got), len(ref))
+        for i in 0..<min(len(got), len(ref)) {
+            testing.expectf(t, got[i].offset == ref[i].offset, "pat=%v 第 %d 条: %d vs %d", pat, i, got[i].offset, ref[i].offset)
+        }
     }
 }
 
@@ -470,6 +623,11 @@ test_matchers_agree_with_reference_search :: proc(t: ^testing.T) {
             got_naive := naive_match(data, ctx, &p)
             defer delete(got_naive)
             expect_same_offsets(t, label, got_naive, want[:], uint(len(pat)))
+
+            // 3) bndm_match：真正的位并行实现，与 naive 必须逐条一致
+            got_bndm := bndm_match(data, ctx, &p)
+            defer delete(got_bndm)
+            expect_same_offsets(t, label, got_bndm, want[:], uint(len(pat)))
 
             // 3) multi_match：无 extra 时等价于单模式（模式表长度为 1）
             got_multi := multi_match(data, ctx, &p)

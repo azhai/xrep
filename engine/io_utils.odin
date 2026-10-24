@@ -218,46 +218,159 @@ print_hex_bytes :: proc(data: []u8, offset: u64, pat_len: uint, sb: ^strings.Bui
 // 行号索引（-n / 行导向输出）
 // ---------------------------------------------------------------------------
 
-// 构建"换行位置表"：返回的 idx 中，idx[i] 是第 i 个 '\n' 的字节偏移（升序）。
-// 偏移 o 所在行号 = "严格小于 o 的换行数" + 1（1-based）。
+// 稀疏换行索引的标记上限。每标记 8 B，上限 256K 标记 → 最多约 2 MB。
+// 定这条线的理由：索引是为"命中多、文件大"的场景准备的（-n 打在 100 MB 文本上），
+// 稠密表是 换行数 × 8 B（300 万行 → 24 MB）。抽稀后每块要回扫"相邻两标记之间"
+// 的那段字节，块越小回扫越省 —— 但标记越多内存越大，2 MB 是实测下来的折中
+// （300 万行 → stride 12 → 每块约 500 B）。
+LINE_INDEX_MAX_MARKS :: 1 << 18
+
+// 稀疏换行索引。
+//   marks[j] — 第 `j*stride` 个 '\n'（0-based）的字节偏移
+//   stride   — 抽样步长；1 表示全量（换行数 ≤ 上限时就是全量）
+//   data     — 原数据视图（**不拥有**，用于块内回扫）
+Line_Index :: struct {
+    marks:  []u64,
+    stride: u64,
+    data:   []u8,
+}
+
+// 行号查询的定位提示：上次查到哪儿、那个位置之前有几个换行。
 //
-// 为什么先建表：流式输出线程可能按分片完成的乱序拿到命中，若每条命中都从头
-// 数换行，单文件代价是 O(命中数 × 文件长度)。建表一次是 O(文件长度)，
-// 之后每条命中 O(log 换行数)。
+// 为什么需要它：只做"二分 + 块内回扫"时，稠密命中（-n 打印几百万行）每条命中
+// 都要重扫一整块 —— 300 万行文本上实测让 `-n` 从 1.0 s 掉到 2.2 s，比全量表
+// 还慢。而输出线程拿到的命中基本是**按偏移递增**的，所以沿上次位置往前数
+// 就是 O(增量)。提示失效（命中乱序、跨块）时才回到二分。
 //
-// 内存代价：换行数 × 8B（100MB 文本约 250 万行 → 20MB）。因此**只在真正需要
-// 行号时才构建**（见 scan.odin 的 line_index_needed）。
+// 归属：调用方持有（见 output_data.line_hint），因此 Line_Index 本身保持只读。
+Line_Hint :: struct {
+    valid: bool,
+    mark:  int, // marks 下标；-1 = 位于第一个标记之前
+    pos:   u64, // 上次查询的位置（扫描从这里继续）
+    count: u64, // 严格小于 pos 的换行数
+}
+
+// 构建稀疏"换行位置表"。
 //
-// 构建本身走 `bytes.index_byte`（core 的 SIMD 实现）一次遍历完成：
-// 原先是"先数一遍、再填一遍"两次标量扫描，等于把整个文件读两遍。
-// 返回切片由调用方 delete。
-build_line_index :: proc(data: []u8) -> []u64 {
-    idx := make([dynamic]u64, 0, 1024)
+// 语义：偏移 o 所在行号 = "严格小于 o 的换行数" + 1（1-based）。
+//
+// 一次遍历完成（`bytes.index_byte` 是 core 的 SIMD 实现）：边扫边按 stride 抽样，
+// 一旦标记数超过 LINE_INDEX_MAX_MARKS 就把**偶数下标留下**、stride 翻倍 ——
+// 于是 marks[j] 始终等于"第 j*stride 个换行"，内存有界而精度自动退化到
+// 每 stride 行一个标记。稠密表（stride=1）与稀疏表的 line_of 是同一条代码路径。
+//
+// 内存：换行数 × 8B 降到 min(换行数, 2×上限) × 8B。
+// 返回的 Line_Index 用 line_index_destroy 释放（data 是视图，不释放）。
+build_line_index :: proc(data: []u8) -> Line_Index {
+    li := Line_Index {
+        data   = data,
+        stride = 1,
+    }
+    marks := make([dynamic]u64, 0, 1024)
     i := 0
+    ordinal := u64(0) // 这是第几个换行（0-based）
     for i < len(data) {
         rel := bytes.index_byte(data[i:], '\n')
         if rel < 0 {
             break
         }
-        append(&idx, u64(i + rel))
-        i += rel + 1
+        p := i + rel
+        if ordinal % li.stride == 0 {
+            append(&marks, u64(p))
+            if len(marks) > LINE_INDEX_MAX_MARKS {
+                // 抽稀：marks[j] = 旧 marks[2j] = 第 2j*stride 个换行
+                k := 0
+                for j := 0; j < len(marks); j += 2 {
+                    marks[k] = marks[j]
+                    k += 1
+                }
+                resize(&marks, k)
+                li.stride *= 2
+            }
+        }
+        ordinal += 1
+        i = p + 1
     }
-    return idx[:]
+    li.marks = marks[:]
+    return li
 }
 
-// 行号（1-based）：二分查找第一个 >= offset 的换行位置，其下标即"前面的换行数"。
-line_of :: proc(index: []u64, offset: u64) -> u64 {
+line_index_destroy :: proc(li: ^Line_Index) {
+    delete(li.marks)
+    li^ = {}
+}
+
+// 行号（1-based）。
+//
+// 慢路径：二分定位到最后一个偏移 < o 的标记（它是第 j*stride 个换行），
+// 于是"严格小于 o 的换行数" = j*stride + 1 + (marks[j], o) 区间里的换行数 ——
+// 后者靠块内回扫数出来。稠密表 stride=1 时该区间为空（零回扫）。
+//
+// 快路径：hint 有效且 o 没跨出当前块时，从 hint.pos 继续往前数，
+// 只扫"新增的那一段"（见 Line_Hint 的说明）。
+//
+// o 超过数据长度时按数据长度截断（与旧的全量表一致：返回"末尾行"的行号）。
+line_of :: proc(li: Line_Index, offset: u64, hint: ^Line_Hint = nil) -> u64 {
+    end := offset
+    n := u64(len(li.data))
+    if end > n {
+        end = n
+    }
+
+    // ---- 快路径：沿用上次定位点 ----
+    if hint != nil && hint.valid && end >= hint.pos {
+        // 块的右边界：下一个标记。跨过它就说明这次查询离开了当前块。
+        next_mark := ~u64(0)
+        mi := hint.mark + 1
+        if mi >= 0 && mi < len(li.marks) {
+            next_mark = li.marks[mi]
+        }
+        if end <= next_mark {
+            count := hint.count
+            for i in hint.pos..<end {
+                if li.data[i] == '\n' {
+                    count += 1
+                }
+            }
+            hint.pos = end
+            hint.count = count
+            return count + 1
+        }
+    }
+
+    // ---- 慢路径：二分 + 块内回扫 ----
     lo := 0
-    hi := len(index)
+    hi := len(li.marks)
     for lo < hi {
         mid := (lo + hi) / 2
-        if index[mid] < offset {
+        if li.marks[mid] < end {
             lo = mid + 1
         } else {
             hi = mid
         }
     }
-    return u64(lo) + 1
+    count := u64(0) // 严格小于 end 的换行数
+    start := u64(0)
+    mark := -1
+    if lo > 0 {
+        mark = lo - 1
+        count = u64(mark) * li.stride + 1 // 含 marks[mark] 这个换行本身
+        start = li.marks[mark] + 1
+    }
+    for i in start..<end {
+        if li.data[i] == '\n' {
+            count += 1
+        }
+    }
+    if hint != nil {
+        hint^ = Line_Hint {
+            valid = true,
+            mark  = mark,
+            pos   = end,
+            count = count,
+        }
+    }
+    return count + 1
 }
 
 // ---------------------------------------------------------------------------

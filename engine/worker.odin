@@ -104,7 +104,8 @@ output_data :: struct {
     offset_hex:    bool,
     show_path:     bool, // 行导向：输出 `path:line:offset`
     line_numbers:  bool, // 输出行号
-    line_index:    []u64, // 换行位置表（仅在需要行号时非空）
+    line_index:    Line_Index, // 稀疏换行索引（仅在需要行号时构建；stride=1 即全量）
+    line_hint:     Line_Hint, // 行号查询提示（只有本线程读写，无需同步）
     only_matching: bool, // -o：额外打印命中字节的 hex
     max_count:     uint, // -m：每文件最多报告多少条（0 = 不限）
     json:          bool, // --json
@@ -164,7 +165,7 @@ output_thread :: proc(data: rawptr) {
         if plen == 0 {
             plen = w.pat_len
         }
-        line := line_of(w.line_index, item.offset)
+        line := line_of(w.line_index, item.offset, &w.line_hint)
 
         // ---- 1) JSON Lines ----
         // 注意：Odin 的 fmt 把 `{` `}` 当作格式语法，字面量大括号必须写成 `{{` `}}`。

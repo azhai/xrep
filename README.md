@@ -206,6 +206,7 @@ main.odin              package main    入口编排（根目录唯一的生产�
 │   └── io_utils.odin
 ├── search/            package search   匹配算法与归并
 │   ├── matcher.odin   └── 仅依赖 lib
+│   ├── ac.odin
 │   ├── merge.odin
 │   └── slice_utils.odin
 └── lib/               package lib      **全部共享数据结构 + 容器**（不依赖任何本工程包）
@@ -249,15 +250,16 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `lib/output_queue.odin` | 生产者/消费者输出队列：`Output_Item` + `Output_Queue`，Mutex + Cond，`done` 标志驱动消费者退出。**内部是环形缓冲**（head/count 游标，O(1) 出队；ADR 0008） |
 | `lib/progress.odin` | 进度条操作（`\r` 原地刷新 + 限流，`--quiet` 或非传统输出模式时整体关闭）；类型定义在 `base.odin` |
 | `app/cli.odin` | `parse_args`（纯解析，不含退出策略；`file_list` **按需分配、调用方负责 `options_destroy`**）、`normalize_args`（`--k=v`、`-t8`、`-rn` 归一化）、短标志别名、`read_pattern_file`、`max_threads_for_machine`、`print_help`/`print_version` |
-| `search/matcher.odin` | `single_match`（SIMD 跳跃 + 密集段就地消费）/ `memchr_match`（首字节 SIMD 预筛 + 倒序验证）/ `naive_match`（兜底）/ `bndm_match`（2..16 入口，委托 `memchr_match`）/ **`multi_match`（多模式，首字节 256 位图预筛）**，以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`。命中数组用 `context.allocator` 分配、**所有权归调用方**（见 ADR 0004；算法分层见 ADR 0008） |
+| `search/matcher.odin` | `single_match`（SIMD 跳跃 + 密集段就地消费）/ `memchr_match`（首字节 SIMD 预筛 + 倒序验证，**候选密度超 1/4 时把剩余区间交给 `bndm_match`**）/ `naive_match`（兜底）/ `bndm_match`（**真正的位并行 BNDM**，u64 位掩码 + 反向窗口）/ `multi_match`（多模式，首字节 256 位图预筛），以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`（≥16 个模式改走 `multi_ac_match`）。命中数组用 `context.allocator` 分配、**所有权归调用方**（ADR 0004；分层见 ADR 0008/0009） |
+| `search/ac.odin` | Aho-Corasick 多模式自动机：`AC`（**字母表压缩到 σ+1 列**的完全转移表 + fail + 输出链接）、`ac_build`/`ac_destroy`、`multi_ac_match`（**延迟线保证输出与 `multi_match` 逐条一致**）、`ac_worth_it` 阈值判据（ADR 0009） |
 | `app/walk.odin` | 目录遍历与 glob：`glob_match`/`walk_dir`/`walk_expand`/`walk_free`（递归、隐藏文件、glob、exclude 的选项类型是 `lib.Walk_Options`） |
 | `search/merge.odin` | `merge_ordered_matches`：多分片命中列表的多路有序归并（游标临时缓冲用后即释放） |
 | `search/slice_utils.odin` | 泛型切片工具：map / fold / filter / take / drop / sort |
 | `engine/worker.odin` | `worker_steal`（扫描线程）与 `output_thread`（唯一打印线程，含 JSON/行导向/`-o`/`-m` 分支）；**线程入口先归一化 `context`**；打印与 dump 均**攒批写出**（64 KiB 阈值）；silent 模式（`-q/-c/-l/-L` 且无 `-m`）跳过实时输出队列（ADR 0008） |
-| `engine/io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加、**攒批**）、**`build_line_index`（SIMD 单次遍历）/`line_of`、`json_escape`、`print_hex_bytes`、`resolve_color`** |
+| `engine/io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加、**攒批**）、**`build_line_index`（`Line_Index`，自适应抽稀的稀疏换行表）/`line_of`（二分 + 块内回扫 + `Line_Hint` 快路径）、`json_escape`、`print_hex_bytes`、`resolve_color`** |
 | `app/scan.odin` | `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**）；选项类型 `lib.Scan_Options` 见 `lib/options.odin` |
 | `app/selftest.odin` | 内建自检 `run_tests`（`--test`），随二进制分发 |
-| `app/bench.odin` | 微基准 `run_bench`（`--bench`）：A 组算法吞吐 + B 组端到端线程伸缩 |
+| `app/bench.odin` | 微基准 `run_bench`（`--bench`）：A1~A3 算法吞吐（含 `multi_match` vs `multi_ac` 的衰减曲线）、A4 两种单模式算法对拍、A5 多模式纯扫描成本、B 组端到端线程伸缩 |
 
 > `arena_pool.odin` 已在 ADR 0004 中删除（arena 定长，无法承载无界的命中结果集）。
 
@@ -269,14 +271,15 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `tools/guard.sh` | 静态护栏：工具自检 → 字面量污染检测 → `make deps`。`verify.sh` 的第 0 层，也可 `make guard` 单独跑 |
 | `tools/literal_allowlist.txt` | 字面量检测的白名单（当前为空；只有**有意**在文本里写 `包名.符号名` 才需要加行） |
 
-### 测试代码（12 个文件，129 个用例）
+### 测试代码（13 个文件，140 个用例）
 
 | 测试文件 | 覆盖目标 | 用例数 |
 | --- | --- | --- |
-| `engine/io_utils_test.odin` | `context_range` 全部边界、文件读取成功/失败、`file_size_of`、`sanitize_dump_name`（绝对/相对/Windows 保留字符/UTF-8/空串）、dump 各形态、**行号表与 `line_of` 二分、`json_escape`、`hex_digit`、`resolve_color`、`print_hex_bytes` 边界** | 21 |
+| `engine/io_utils_test.odin` | `context_range` 全部边界、文件读取成功/失败、`file_size_of`、`sanitize_dump_name`（绝对/相对/Windows 保留字符/UTF-8/空串）、dump 各形态、**稀疏行号表（`stride=1` 全量路径 + 抽稀后逐偏移对照增量参照 + `Line_Hint` 快慢两条路径 + 乱序访问）、`json_escape`、`hex_digit`、`resolve_color`、`print_hex_bytes` 边界** | 22 |
 | `app/cli_test.odin` | 参数解析：默认值、位置参数分配、全部长短标志、**`--k=v` 等号形式、短标志捆绑、多模式、`-f`、`--color`、遍历/输出开关**、错误分支、`--help`/`--version` 即时性 | 24 |
 | `app/scan_test.odin` | 端到端扫描：计数、线程数一致性、区间过滤、`--limit` 契约语义、dump 与 dump-prefix 清洗、`--dump-append`/`--skip-empty`/`--max-size`/空文件快速跳过/落盘失败上报、跨分片归并有序、文件缺失、`-l/-L`、`-m` 截断、多模式端到端、**`Run_Stats` 四条计数各自的累加规则**、`legacy_output` / `line_index_needed` 真值表、**分片重叠窗口的重复上报契约** | 21 |
-| `search/matcher_test.odin` | 算法选择表边界（1/2/16/17/64/65/0、区间外回退）、重叠命中、大小写、空模式、NUL 字节、算法间一致性、多模式 `multi_match` 与 `select_matcher_for` 分派、稠密命中不被截断（ADR 0004 回归）、**差分测试（8 种模式 × 大小写两态 × 三条实现路径，对照 `core:strings` 参考实现）**、**多模式 = 单模式多重集并集**、**各算法向 `Progress` 上报的字节数** | 13 |
+| `search/matcher_test.odin` | 算法选择表边界（1/2/16/17/64/65/0、区间外回退）、重叠命中、大小写、空模式、NUL 字节、算法间一致性、多模式 `multi_match` 与 `select_matcher_for` 分派、稠密命中不被截断（ADR 0004 回归）、**差分测试（8 种模式 × 大小写两态 × 四条实现路径含位并行 BNDM，对照 `core:strings` 参考实现）**、**多模式 = 单模式多重集并集**、**各算法向 `Progress` 上报的字节数** | 15 |
+| `search/ac_test.odin` | 自动机正确性：**输出顺序与 `multi_match` 逐条一致**（多长度模式同起点、重复模式、跨边界命中）、空模式/空数据、单字节模式、`-i` 大小写、**延迟线（长模式起点更小）**、`ac_worth_it` 阈值与超限回退、64 个模式的端到端一致 | 8 |
 | `app/walk_test.odin` | glob 语义（`*` 不跨 `/`、`**` 跨 `/`、`?`、转义、basename 规则）、递归/非递归、隐藏文件、exclude、按后缀过滤、空输入、**不可读目录的容错**、**`strip_dot_slash`/`join_path`/`walk_hidden`/`walk_excluded`/`walk_glob_ok` 纯函数** | 16 |
 | `lib/progress_test.odin` | 初始化字段、禁用时不累加 `scanned`、启用时累加与限流、`total=0` 渲染短路 | 5 |
 | `search/slice_utils_test.odin` | map/fold/filter/take/drop/sort 的空切片、n=0、n=len、n>len、重复键等边界 | 5 |
@@ -286,8 +289,8 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `lib/task_pool_test.odin` | 空池出队、LIFO 顺序、取空后可复用、**4 线程抢 200 任务：每个任务恰好被弹出一次** | 4 |
 | `engine/worker_test.odin` | **命中偏移从分片相对改写为文件绝对**（`--after/--before`/`--dump`/行号都依赖它）、多任务产出多分片列表、空任务池立即退出、多模式分派确实走 `multi_match`、**输出线程的 `-m` 计数契约与 done 退出** | 4 |
 
-> 用例数合计 129；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
-> 逐包分布：lib 19、search 24、engine 25、app 61（`odin test` 一次只跑一个包，
+> 用例数合计 140；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
+> 逐包分布：lib 19、search 34、engine 26、app 61（`odin test` 一次只跑一个包，
 > 见上节）。新增子目录包时，记得把路径加进 `test.sh` 的 `PACKAGES`。
 
 ### 关于"没有输出文本断言"
@@ -337,32 +340,41 @@ tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update /
 
 ### 微基准（`--bench`，约 7s）
 
-两组测量，全部在内存里的合成数据上跑，不落盘：
+五组测量，全部在内存里的合成数据上跑，不落盘：
 
-- **A 组 · 匹配算法吞吐**（100 MiB 周期数据，每档 5 轮取**最快一轮**）：
-  按模式长度分档 1B / 2B / 4B / 16B / 17B / 64B / 128B —— 正好覆盖 `alg_table`
-  的每一档与表外回退；再加 `-i`（大小写不敏感）与 2/4 模式（`multi_match`）。
-  每个 case 都经 `select_matcher_for` 分派，因此打印的算法名就是实际执行的那个，
-  顺带验证了长度分派。
+- **A1/A2 · 单模式吞吐**（100 MiB 周期数据，每档 5 轮取**最快一轮**）：
+  按模式长度分档 1B / 2B / 4B / 16B / 17B / 64B / 128B —— 覆盖 `alg_table`
+  的每一档与表外回退，再加 `-i`（大小写不敏感）。每个 case 都经
+  `select_matcher_for` 分派，因此打印的算法名就是实际执行的那个。
+- **A3 · 多模式衰减曲线**：同一份数据上 `multi_match` 与 `multi_ac` 各跑一遍
+  （4 / 8 / 16 / 32 / 64 个模式），交叉点就是 AC 的启用阈值（ADR 0009）。
+- **A4 · 单模式算法对拍**：`memchr_match` 与 `bndm_match` 在三种极端数据上
+  各跑一遍（首字节稀疏 / 命中稠密 / 首字节几乎全中），用来确认"谁是主路径、
+  谁只做退化出口"。
+- **A5 · 多模式纯扫描成本**：稀疏数据（几乎无命中）上跑两种多模式实现，
+  把"扫描"从"命中发射"里剥出来 —— 否则稠密数据测的是结果数组的追加成本。
 - **B 组 · 端到端线程伸缩**（64 MiB 稀疏数据，每档 3 轮取最快一轮）：
-  直接跑 `scan_region_parallel` —— 任务池 + worker + 输出队列 + 归并的完整路径，
-  报告 1/2/4/8 线程的吞吐与相对加速比。单看 A 组只说明"算法有多快"，
-  B 组才说明"多线程有没有用"。
+  直接跑 `scan_region_parallel` —— 任务池 + worker + 输出队列 + 归并的完整路径。
 
-本机（10 逻辑核）实测输出示例（ADR 0008 之后）：
+本机（10 逻辑核）实测输出示例（ADR 0009 之后）：
 
 ```
 -- A1. single pattern, case sensitive --
-  1B       single_match   22972.66 MB/s
-  4B       bndm_match     34118.05 MB/s
- 17B      memchr_match   17129.15 MB/s
-128B      memchr_match    3709.47 MB/s
+  1B       single_match   24491.80 MB/s
+  4B       memchr_match   31816.74 MB/s
+ 17B       memchr_match   15487.07 MB/s
+128B       memchr_match    3655.91 MB/s
 -- A3. multi pattern (-e / -f) --
-  2 pat    multi_match     1502.47 MB/s
-  4 pat    multi_match     1219.02 MB/s
+  4 pat    multi_match      963.60 MB/s      4 pat   multi_ac   195.44 MB/s
+ 16 pat   multi_match      416.75 MB/s     16 pat   multi_ac   177.08 MB/s
+ 64 pat   multi_match       39.88 MB/s     64 pat   multi_ac   134.70 MB/s
+-- A4. memchr (SIMD) vs bndm (bit-parallel), 16 MiB each --
+  uniform  memchr_match   34115.14 MB/s     uniform  bndm_match   7670.18 MB/s
+  dense    memchr_match      87.13 MB/s     dense    bndm_match    163.74 MB/s
+  zeros    memchr_match     813.67 MB/s     zeros    bndm_match    836.12 MB/s
 -- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / 65536 B) --
-  1 thread(s)        64581.23 MB/s   1.00x
-  8 thread(s)        95808.38 MB/s   1.48x
+  1 thread(s)        57813.91 MB/s   1.00x
+  8 thread(s)        88154.27 MB/s   1.52x
 ```
 
 口径说明：A 组取"最快一轮"是因为别的负载与调度抖动只会让结果变慢，
@@ -370,7 +382,12 @@ tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update /
 不再是瓶颈（1 线程就有 60+ GB/s），剩下的是内存带宽与线程同步 ——
 衡量多线程价值要看绝对吞吐，而不要只看倍数。
 
-### 基线：129 用例全绿、0 内存泄漏
+**A3/A5 的结论不能只看一组**：A3 是稠密命中（每个模式每 256 字节一次），
+`multi_match` 的"每位置 × 模式数"随模式数塌方，AC 的常数成本反而赢；
+A5 是稀疏命中，`multi_match` 的首字节位图几乎全拒绝，`multi_ac` 慢一档。
+真实文本上的交叉点在 16 个模式附近（ADR 0009 有实测表），阈值据此设定。
+
+### 基线：140 用例全绿、0 内存泄漏
 
 内存追踪**保持开启**（`test.sh` 不再传 `ODIN_TEST_TRACK_MEMORY=false`）。
 基线就是"全绿且没有任何 `+++ leak` 告警"——因此**看到 leak 就是真问题**，
@@ -379,8 +396,8 @@ tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update /
 - `merge_ordered_matches(...)` 的返回值、`parse_args(...)` 的 `Options.file_list`
   （用 `options_destroy(&opts)` 一次释放）、`os.read_entire_file(...)` 的缓冲、
   `slice_map`/`slice_filter` 的结果、**`single_match`/`naive_match`/`bndm_match`/
-  `multi_match` 的返回值**都由调用方 `delete`；`os.stat` 返回的 `File_Info`
-  需 `file_info_delete`。只判存在性时用 `os.exists(path)`，它不分配。
+  `multi_match`/`multi_ac_match` 的返回值**都由调用方 `delete`；`os.stat` 返回的
+  `File_Info` 需 `file_info_delete`。只判存在性时用 `os.exists(path)`，它不分配。
 - 自建线程的入口必须先 `context = runtime.default_context()`（见下节）。
 - **worker 线程产出的东西，内外两层都要用默认分配器释放**：
   命中数组是 matcher 在 worker 线程里分配的，而分片列表的 dynamic 数组是被
@@ -574,6 +591,15 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
   `-q/-c/-l/-L`（且无 `-m`）跳过输出队列、打印与 dump 攒批写出（64 KiB）；
   数据结构侧 `Output_Queue` 改为环形缓冲（O(1) 出队）。
   **对外行为零变化**：golden 矩阵与 dump 产物均逐字节一致，只有耗时变化。
+- `ADR 0009`（`.ai-memory/adr/0009-bit-parallel-and-sparse-structures.md`）：
+  把 ADR 0008 登记为"未做"的两项补完，并加一项数据结构改造。
+  ① **位并行 BNDM**（u64 位掩码）落地，但实测它是"密度高时不崩"的退化出口，
+  不是更快的主算法（uniform 数据上 SIMD 预筛仍快 4.5 倍），因此只在候选密度
+  超 1/4 时接管剩余区间；② **Aho-Corasick**（字母表压缩的完全转移表 + 输出链接
+  + 延迟线保序），模式数 ≥16 时启用（真实文本实测交叉点）；
+  ③ 行号表改为**自适应抽稀的稀疏索引 + `Line_Hint` 查询提示**，
+  300 万行文本上索引 24 MB → 2 MB，`-n` 1.04 s → 0.91 s。
+  **对外行为零变化**：140 用例全绿，golden 与 dump 逐字节一致。
 
 
 
@@ -599,9 +625,13 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
 3. 「契约」`--limit N` 只截断 pretty **汇总行**，且截断前会先丢弃前 2 条命中；
    `--count` 与 `--dump` 使用完整结果集。注意命中明细是由输出线程流式打印的，
    本身不受 `--limit` 限制。本项**未修改**（保留原语义）。
-4. 「契约」`bndm_match`（2..16 字节模式）**仍未实现**位并行算法：ADR 0008 之后它
-   委托 `memchr_match`（SIMD 预筛 + 倒序验证），**结果与朴素扫描完全一致**，
-   只是更快。17..4096 字节同样走 `memchr_match`；表外（>4096）回退 `naive_match`。
+4. 「变更 ADR 0009」`bndm_match` 现在是**真正的位并行 BNDM**（u64 位掩码 + 反向
+   窗口），覆盖 2..64 字节；**结果与朴素扫描逐条一致**。但它不再是主路径：
+   `memchr_match`（SIMD 预筛 + 倒序验证）负责 2..4096 字节，只有当候选密度
+   超过 1/4（扫过 ≥4 KiB 后判定）时，剩余区间才整体交给 `bndm_match`。
+   表外（>4096）回退 `naive_match`。
+   「变更新增」多模式在**模式数 ≥16** 时改走 Aho-Corasick（`multi_ac_match`），
+   阈值与实测交叉点见 ADR 0009；输出顺序与 `multi_match` 逐条一致。
 5. 「变更 ADR 0002」`--dump-prefix P` 展开为 `P{sanitized(path)}.txt`：文件名中的路径分隔符
    （`/` `\`）与 Windows 保留字符（`: * ? " < > |`）被替换为 `_`，长度不变。
    因此不再需要预先创建与输入路径同构的目录层级（原行为会生成
