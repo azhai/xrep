@@ -51,6 +51,43 @@ line_index_needed :: proc(o: lib.Scan_Options) -> bool {
     return o.line_numbers || o.show_path || o.json
 }
 
+// 调用方是否需要**逐条明细**。只需要"几条"或"有没有"时，归并后的有序数组是白造的：
+// 每条命中的偏移在归并里要被搬一次、比较 log K 次，而结果只被 len() 吃掉。
+//
+// 反过来看这件事更清楚：`--count` / `-l` / `-L` / `--quiet` 的语义里没有"哪一条"，
+// 只有"多少条"。ADR 0011 把归并从 287 ms 降到十几毫秒之后，剩下的账就是
+// "根本不必归并"。
+needs_items :: proc(o: lib.Scan_Options) -> bool {
+    if len(o.dump_path) > 0 || len(o.dump_prefix) > 0 {
+        return true // 落盘要偏移序列
+    }
+    if o.max_count > 0 {
+        return true // -m 要的是"前 N 条的偏移"，且流式打印就靠它
+    }
+    if o.list_mode != .None {
+        return false // -l / -L：只回答"有没有"
+    }
+    if o.only_count || o.quiet {
+        return false // -c / --quiet：只要数
+    }
+    return true // 传统输出 / 行号 / -o / --json 都要明细
+}
+
+// 不归并也算得出区间内的条数：每个分片列表各自**有序**，所以
+// "偏移落在 [after, before]" 在该列表上是一段连续区间，二分上下界即得。
+// 每列表 O(log n)，与列表条数成正比而与命中总数无关 —— 这正是跳过归并的收益。
+count_in_range :: proc(lists: [][]lib.Match_Result, after, before: u64) -> uint {
+    n: uint
+    for lst in lists {
+        lo := search.lower_bound(lst, after)
+        hi := search.upper_bound(lst, before)
+        if hi > lo {
+            n += uint(hi - lo)
+        }
+    }
+    return n
+}
+
 // 扫描单个文件。
 // 返回值：
 //   hits    — 区间过滤 + 上限截断后的命中数
@@ -87,9 +124,12 @@ scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bo
     file_size := uint(len(file_data))
 
     // ---- 命中结果：空文件直接为空，避免为一无所有的文件建池起线程 ----
+    // `hit_count` 与 `filtered` 分开返回：只需要计数时 `filtered` 是 nil，
+    // 但仍要报出准确的条数（见 needs_items / count_in_range）。
     filtered: []lib.Match_Result
+    hit_count: uint
     if file_size > 0 {
-        filtered = scan_region_parallel(file_data, o, label)
+        filtered, hit_count = scan_region_parallel(file_data, o, label)
     }
     // 重要：Odin 的 defer 是**块作用域**——写在 if 体内会在该 if 结束时就执行。
     // 因此释放必须挂在函数作用域上，否则 filtered 会在落盘读取之前被释放，
@@ -103,10 +143,11 @@ scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bo
     // ---- --max-count：归并结果同样截断到 N，与流式打印的条数保持一致 ----
     if o.max_count > 0 && uint(len(filtered)) > o.max_count {
         filtered = filtered[:o.max_count]
+        hit_count = uint(len(filtered)) // 截断后的条数才是对外口径
     }
 
     // ---- 落盘：--dump-prefix 优先；--skip-empty 时不产出空文件 ----
-    if !(o.skip_empty && len(filtered) == 0) {
+    if !(o.skip_empty && hit_count == 0) {
         final_dump_path := o.dump_path
         if len(o.dump_prefix) > 0 {
             // 清洗路径分隔符后再拼接：--dump-prefix 会把输入文件路径直接写进
@@ -124,8 +165,8 @@ scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bo
     if o.stats != nil {
         o.stats.files_scanned += 1
         o.stats.bytes_scanned += u64(file_size)
-        o.stats.total_hits += u64(len(filtered))
-        if len(filtered) > 0 {
+        o.stats.total_hits += u64(hit_count)
+        if hit_count > 0 {
             o.stats.files_matched += 1
         }
     }
@@ -133,33 +174,33 @@ scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bo
     // ---- -l / -L：只输出"有/无命中"的文件名，抑制其它一切 stdout ----
     switch o.list_mode {
     case .Files_With:
-        if len(filtered) > 0 {
+        if hit_count > 0 {
             print_file_verdict(label, o.json, true)
         }
-        return len(filtered), dump_ok
+        return hit_count, dump_ok
     case .Files_Without:
-        if len(filtered) == 0 {
+        if hit_count == 0 {
             print_file_verdict(label, o.json, false)
         }
-        return len(filtered), dump_ok
+        return hit_count, dump_ok
     case .None:
     // 继续走常规输出
     }
 
     // ---- 统计输出（quiet 完全静默，交给调用方聚合）----
     if o.quiet {
-        return len(filtered), dump_ok
+        return hit_count, dump_ok
     }
     if o.only_count {
         if o.json {
             // Odin 的 fmt 把 `{` `}` 当格式语法：字面量大括号写成 `{{` `}}`。
             esc := engine.json_escape(label)
-            fmt.printf("{{\"file\":\"%s\",\"count\":%d}}\n", esc, len(filtered))
+            fmt.printf("{{\"file\":\"%s\",\"count\":%d}}\n", esc, hit_count)
             delete(esc)
         } else {
-            fmt.printf("%s: %d hits\n", label, len(filtered))
+            fmt.printf("%s: %d hits\n", label, hit_count)
         }
-        return len(filtered), dump_ok
+        return hit_count, dump_ok
     }
     if legacy_output(o) {
         // 既有行为（契约，见 README 已知行为#3）：pretty 汇总会先丢弃前 2 条命中。
@@ -171,7 +212,7 @@ scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bo
         }
         fmt.printf("\n=== %s: %d results ===\n", label, len(taken))
     }
-    return len(filtered), dump_ok
+    return hit_count, dump_ok
 }
 
 // -l / -L 的单文件输出；--json 时输出对象而非裸文件名。
@@ -205,7 +246,7 @@ prof_mark :: proc(name: string) {
 
 // 对已读入的整块数据执行并行扫描，返回区间过滤后的命中（按偏移升序）。
 // 调用方负责释放返回切片。
-scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string) -> []lib.Match_Result {
+scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string) -> (filtered: []lib.Match_Result, count: uint) {
     pv := os.get_env_alloc("XREP_PROFILE", context.allocator)
     prof_on = pv != ""
     delete(pv)
@@ -234,7 +275,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     }
     tp: lib.Task_Pool
     if !lib.task_pool_init(&tp, lib.pool_capacity_for(int(task_count))) {
-        return nil
+        return
     }
     defer lib.task_pool_destroy(&tp)
     for pos := uint(0); pos < file_size; {
@@ -243,7 +284,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
             end = file_size
         }
         if !lib.task_pool_push(&tp, lib.Scan_Task{start = pos, end = end}) {
-            return nil
+            return
         }
         pos = end
     }
@@ -251,7 +292,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     // ---- 2) 准备共享资源：输出队列 / 命中汇总 ----
     out_q: lib.Output_Queue
     if !lib.output_queue_init(&out_q) {
-        return nil
+        return
     }
     defer lib.output_queue_destroy(&out_q)
     // ADR 0010：每 worker 一个**独占**的 dynamic 数组，worker 只 append 自己的
@@ -345,8 +386,18 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     // ADR 0011：归并从"线性扫描 + 单线程"换成"最小堆 + 按 rank 精确切分的并行归并"。
     // 64 MiB 稠密命中（8.4 M 条 / 32 个分片列表）实测 287 ms → 十几毫秒，
     // 且输出与旧的串行归并**逐条相同**（切分只依赖数据，不依赖分区数）。
-    merged := engine.merge_ordered_matches_parallel(flat, int(thread_count))
-    prof_mark("merge")
+    //
+    // 需要明细才归并。`-c` / `-l` / `-L` / `--quiet` 只消费条数，而条数可以在
+    // 不归并的情况下精确算出来（count_in_range：每列表二分上下界）。
+    want_items := needs_items(o)
+    merged: []lib.Match_Result
+    if want_items {
+        merged = engine.merge_ordered_matches_parallel(flat, int(thread_count))
+        prof_mark("merge")
+    } else {
+        count = count_in_range(flat, o.after, o.before)
+        prof_mark("count")
+    }
     // 归并只读取内容，不接管所有权；各分片的命中数组必须在这里逐个释放。
     // （此前 worker 会把命中"深拷贝到堆"再挂进 match_lists，而只释放了外层
     //  dynamic 数组 —— 内层切片从未被释放，是一次每分片一次的隐蔽泄漏：
@@ -376,18 +427,22 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     //
     // 前移而不是直接返回子切片，是因为调用方 `delete(filtered)` 要求指针落在
     // 分配起点上 —— 与 `--max-count` 的 `filtered = filtered[:n]` 同一个约束。
-    filtered := merged
-    if o.after > 0 || o.before != max(u64) {
-        lo := search.lower_bound(merged, o.after)
-        hi := search.upper_bound(merged, o.before)
-        if lo > 0 {
-            copy(merged[:hi - lo], merged[lo:hi])
+    if want_items {
+        filtered = merged
+        if o.after > 0 || o.before != max(u64) {
+            lo := search.lower_bound(merged, o.after)
+            hi := search.upper_bound(merged, o.before)
+            if lo > 0 {
+                copy(merged[:hi - lo], merged[lo:hi])
+            }
+            filtered = merged[:hi - lo]
         }
-        filtered = merged[:hi - lo]
+        count = uint(len(filtered))
+        prof_mark("filter")
     }
-    prof_mark("filter")
     if prof_on {
-        fmt.eprintf("[prof] merge in: %d lists, %d matches\n", total_lists, len(merged))
+        fmt.eprintf("[prof] %s in: %d lists, %d matches\n",
+                    want_items ? "merge" : "count", total_lists, count)
     }
-    return filtered
+    return
 }

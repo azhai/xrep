@@ -76,7 +76,7 @@ bench_round :: proc(m: lib.Match_Fn, data: []u8, ctx: lib.Match_Ctx, p: ^lib.Pro
 // 跑一轮端到端并行扫描并计时（返回值由主线程 delete，用的是主线程的分配器）。
 bench_scan_round :: proc(data: []u8, o: lib.Scan_Options, label: string) -> time.Duration {
     start := time.now()
-    hits := scan_region_parallel(data, o, label)
+    hits, _ := scan_region_parallel(data, o, label)
     delete(hits)
     return time.since(start)
 }

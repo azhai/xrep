@@ -251,6 +251,7 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `lib/progress.odin` | 进度条操作（`\r` 原地刷新 + 限流，`--quiet` 或非传统输出模式时整体关闭）；类型定义在 `base.odin` |
 | `app/cli.odin` | `parse_args`（纯解析，不含退出策略；`file_list` **按需分配、调用方负责 `options_destroy`**）、`normalize_args`（`--k=v`、`-t8`、`-rn` 归一化）、短标志别名、`read_pattern_file`、`max_threads_for_machine`、`print_help`/`print_version` |
 | `search/matcher.odin` | `single_match`（SIMD 跳跃 + 密集段就地消费）/ `memchr_match`（首字节 SIMD 预筛 + 倒序验证，**候选密度超 1/4 时把剩余区间交给 `bndm_match`**）/ `naive_match`（兜底）/ `bndm_match`（**真正的位并行 BNDM**，u64 位掩码 + 反向窗口）/ `multi_match`（多模式，首字节 256 位图预筛），以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`（≥16 个模式改走 `multi_ac_match`）。命中数组用 `context.allocator` 分配、**所有权归调用方**（ADR 0004；分层见 ADR 0008/0009） |
+| `search/scan.odin` | `index_either`：**双候选单趟**的 SIMD 首字节预筛（每轮 64 B / 4 个 `u8x16`）。`find_byte` 的单候选仍走 `core:bytes.index_byte`，双候选（大小写不敏感）走这里 —— 旧写法 `min(index_byte(a), index_byte(b))` 是两趟完整扫描，稀疏命中时流量翻倍，密集命中时退化成 O(n²)（ADR 0012） |
 | `search/ac.odin` | Aho-Corasick 多模式自动机：`AC`（**字母表压缩到 σ+1 列**的完全转移表 + fail + 输出链接）、`ac_build`/`ac_destroy`、`multi_ac_match`（**延迟线保证输出与 `multi_match` 逐条一致**）、`ac_worth_it` 阈值判据（ADR 0009） |
 | `app/walk.odin` | 目录遍历与 glob：`glob_match`/`walk_dir`/`walk_expand`/`walk_free`（递归、隐藏文件、glob、exclude 的选项类型是 `lib.Walk_Options`） |
 | `search/merge.odin` | `merge_ordered_matches`：多分片命中列表的多路有序归并（游标临时缓冲用后即释放） |

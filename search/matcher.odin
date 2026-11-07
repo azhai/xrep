@@ -47,22 +47,18 @@ alt_case :: proc "contextless" (lower_b: u8) -> u8 {
 
 // 在 d 中找 a（或 a/b 两者中较早的）第一次出现的位置。
 //
-// 走 `bytes.index_byte` 而不是自己写循环：那是 core 的 SIMD 实现
-// （amd64+AVX2 用 256 位、其它平台 128 位，不足 16 字节退化为标量），
-// 稀疏数据下比逐字节扫描快一个数量级；它是 "contextless"，不碰分配器。
+// 单候选走 `bytes.index_byte`：那是 core 的 SIMD 实现（amd64+AVX2 用 256 位、
+// arm64 每轮 64 字节 4 个 128 位向量），稀疏数据下比逐字节扫描快一个数量级，
+// 且是 "contextless"，不碰分配器。
+//
+// 双候选（大小写不敏感）走 `index_either`：**一趟**里同时比两个字节。
+// 这里曾经是 `min(index_byte(a), index_byte(b))` —— 两趟完整扫描，稀疏命中时
+// 内存流量翻倍（256 MiB 实测 30.3 → 62.5 GB/s）。
 find_byte :: proc "contextless" (d: []u8, a: u8, b: u8, two: bool) -> int {
-    ia := bytes.index_byte(d, a)
     if !two {
-        return ia
+        return bytes.index_byte(d, a)
     }
-    ib := bytes.index_byte(d, b)
-    if ia < 0 {
-        return ib
-    }
-    if ib < 0 {
-        return ia
-    }
-    return ia if ia < ib else ib
+    return index_either(d, a, b)
 }
 
 // 验证 data[at:at+m] 是否等于 pat。首字节已由预筛保证相等，故从 j=m-1
