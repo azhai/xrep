@@ -113,7 +113,7 @@ test_runtime_constants_sane :: proc(t: ^testing.T) {
     // 常量抽取后仍需满足基本不变量，避免误调
     testing.expect(t, TASK_CHUNK_SIZE > 0, "分片大小必须为正")
     testing.expect(t, CHUNK_OVERLAP > 0, "重叠窗口必须为正")
-    testing.expect(t, PROGRESS_MIN_INTERVAL > 0, "进度刷新间隔必须为正")
+    testing.expect(t, PROGRESS_MIN_INTERVAL_NS > 0, "进度刷新间隔必须为正")
     testing.expect(t, MAX_THREADS_FACTOR >= 1, "线程数上限倍数至少为 1")
     testing.expect(t, FALLBACK_MAX_THREADS >= DEFAULT_THREAD_COUNT, "兜底上界不应小于默认线程数")
 }

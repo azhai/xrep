@@ -1,3 +1,4 @@
+#+dialect hela
 package engine
 
 // ============================================================================
@@ -31,19 +32,27 @@ import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:sync"
 import "xrep:lib"
 import "xrep:search"
 
+// ADR 0010（Hela 方言）：本文件的跨线程结构全部改为显式契约——
+//   * 命中汇总从「共享 dynamic 数组 + list_mu」改为**每 worker 一个固定槽**
+//     （out_lists[idx]）：地址互不重叠，天然免锁，这是 shared-nothing 的直接结论；
+//   * 命中计数 out_hits 只有输出线程一个写者，锁是历史冗余，已删除；
+//   * 任务池 / 输出队列的锁已由 lib 层换成的无锁环吸收（见 task_pool.odin /
+//     output_queue.odin）。
+
 // 线程参数聚合体。用结构体打包而非多个全局变量，是为了让线程入口只依赖一个
 // rawptr，也让"哪些数据被共享"一目了然（凡是指针字段均为跨线程共享）。
+// ADR 0010：out_list 指向**本 worker 独占**的 dynamic 数组——一个 worker 可能
+// 抢到多个任务，每任务的命中列表 append 进自己的数组；地址互不重叠，
+// 所有权按 worker 划分，list_mu 不复存在。
 worker_data :: struct {
     file_data: []u8,
     ctx:       lib.Match_Ctx,
-    tp:        ^lib.Task_Pool, // 共享：任务来源
-    out_q:     ^lib.Output_Queue, // 共享：实时输出队列
-    out_list:  ^[dynamic][]lib.Match_Result, // 共享：命中汇总（受 list_mu 保护）
-    list_mu:   ^sync.Mutex,
+    tp:        ^lib.Task_Pool, // 共享：任务来源（无锁 MPMC）
+    out_q:     ^lib.Output_Queue, // 共享：实时输出队列（无锁 + 反压）
+    out_list:  ^[dynamic][]lib.Match_Result, // 本 worker 独占：只有它 append
     progress:  ^lib.Progress,
     no_stream: bool, // 明细不会被打印时跳过输出队列（见下方说明）
 }
@@ -85,9 +94,8 @@ worker_steal :: proc(data: rawptr) {
                 lib.output_queue_push(w.out_q, lib.Output_Item{offset = matches[m].offset, pat_len = matches[m].pat_len})
             }
         }
-        sync.mutex_lock(w.list_mu)
+        // append 进本 worker 独占的数组：与其它 worker 的地址互不重叠，无需任何锁。
         append(w.out_list, matches)
-        sync.mutex_unlock(w.list_mu)
     }
 }
 
@@ -110,8 +118,7 @@ output_data :: struct {
     max_count:     uint, // -m：每文件最多报告多少条（0 = 不限）
     json:          bool, // --json
     silent:        bool, // --quiet / --count / -l / -L：不打明细（但仍计数）
-    out_hits:      ^uint, // 共享：命中计数（受 hit_mu 保护）
-    hit_mu:        ^sync.Mutex,
+    out_hits:      ^uint, // 计数出口：仅本线程在循环内累加，退出前写回；join 后主线程可读
 }
 
 // 输出线程主体：从队列取命中，按选定格式打印，并累加计数。
@@ -131,6 +138,8 @@ output_thread :: proc(data: rawptr) {
     context = runtime.default_context()
     w := cast(^output_data)data
 
+    hits: uint = 0 // 本地计数；循环结束后写回 out_hits
+
     sb: strings.Builder
     strings.builder_init(&sb)
     // 收敛路径只有一处（队列空且 done），但**提前 return / 崩溃**都会漏 flush。
@@ -138,6 +147,10 @@ output_thread :: proc(data: rawptr) {
     // 注意 defer 必须写在函数体顶层 —— Odin 的 defer 是块作用域，
     // 写在循环或 if 里会在该块结束时就把缓冲刷出去。
     defer {
+        // 计数写回：发生在 join 之前（本线程即将退出），主线程 join 后读取安全。
+        if w.out_hits != nil {
+            w.out_hits^ = hits
+        }
         if len(sb.buf) > 0 {
             os.write(os.stdout, sb.buf[:])
         }
@@ -149,13 +162,13 @@ output_thread :: proc(data: rawptr) {
         if !ok {
             break
         }
-        // ---- 计数： --max-count 覆盖计数与打印 ----
-        sync.mutex_lock(w.hit_mu)
-        reached := w.max_count > 0 && w.out_hits^ >= w.max_count
+        // ---- 计数：--max-count 覆盖计数与打印 ----
+        // ADR 0010：计数是输出线程的**本地**变量——这把锁从建立之初就只保护
+        // 一个单线程读写的计数，属于纯冗余。
+        reached := w.max_count > 0 && hits >= w.max_count
         if !reached {
-            w.out_hits^ += 1
+            hits += 1
         }
-        sync.mutex_unlock(w.hit_mu)
         if reached || w.silent {
             continue
         }

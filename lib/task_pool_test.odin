@@ -1,11 +1,17 @@
+#+dialect hela
 package lib
 
 // ============================================================================
 // task_pool_test.odin — 任务池单元测试
 //
-// 覆盖：空池出队返回 false、入队/出队 LIFO 顺序、全部取空后重复出队、
+// 覆盖：空池出队返回 false、入队/出队 FIFO 顺序、全部取空后重复出队、
 //       单条任务、区间字段在传递过程中不被篡改，
 //       以及多线程并发弹出时"每个任务被取走恰好一次"。
+//
+// ADR 0010：底层从 Mutex+LIFO 动态数组换成 core:hela/queue 的无锁 MPMC 环，
+//       顺序断言由 LIFO 改为 FIFO —— 这是**有意的行为变更**：任务顺序对结果
+//       正确性无影响（命中集合与顺序无关，跨分片顺序由 merge_ordered_matches
+//       恢复），换取的是临界区消失。
 //
 // 线程上下文：自建线程的入口必须先 `context = runtime.default_context()` ——
 //       `odin test` 下调用方的分配器是 mem.Tracking_Allocator（内部无锁 map），
@@ -42,7 +48,7 @@ pool_worker :: proc(data: rawptr) {
 @(test)
 test_task_pool_empty_pop :: proc(t: ^testing.T) {
     p: Task_Pool
-    task_pool_init(&p)
+    testing.expect(t, task_pool_init(&p, pool_capacity_for(1)), "init 应成功")
     defer task_pool_destroy(&p)
 
     // 边界：空池出队必须失败且任务为零值
@@ -56,20 +62,21 @@ test_task_pool_empty_pop :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_task_pool_lifo_order :: proc(t: ^testing.T) {
+test_task_pool_fifo_order :: proc(t: ^testing.T) {
     p: Task_Pool
-    task_pool_init(&p)
+    testing.expect(t, task_pool_init(&p, pool_capacity_for(3)), "init 应成功")
     defer task_pool_destroy(&p)
 
-    task_pool_push(&p, Scan_Task{start = 0, end = 10})
-    task_pool_push(&p, Scan_Task{start = 10, end = 20})
-    task_pool_push(&p, Scan_Task{start = 20, end = 30})
+    // push 的返回值在有界契约下必须被检查（容量足够时应恒成功）
+    testing.expect(t, task_pool_push(&p, Scan_Task{start = 0, end = 10}), "push 应成功")
+    testing.expect(t, task_pool_push(&p, Scan_Task{start = 10, end = 20}), "push 应成功")
+    testing.expect(t, task_pool_push(&p, Scan_Task{start = 20, end = 30}), "push 应成功")
 
-    // pop 取尾部（LIFO）
+    // 无锁环是 FIFO（ADR 0010 的有意变更）
     ok1, a := task_pool_pop(&p)
     testing.expect(t, ok1)
-    testing.expect_value(t, a.start, uint(20))
-    testing.expect_value(t, a.end, uint(30))
+    testing.expect_value(t, a.start, uint(0))
+    testing.expect_value(t, a.end, uint(10))
 
     ok2, b := task_pool_pop(&p)
     testing.expect(t, ok2)
@@ -77,8 +84,8 @@ test_task_pool_lifo_order :: proc(t: ^testing.T) {
 
     ok3, c := task_pool_pop(&p)
     testing.expect(t, ok3)
-    testing.expect_value(t, c.start, uint(0))
-    testing.expect_value(t, c.end, uint(10))
+    testing.expect_value(t, c.start, uint(20))
+    testing.expect_value(t, c.end, uint(30))
 
     // 取空后回到失败态：可安全地被多个 worker 反复调用
     ok4, _ := task_pool_pop(&p)
@@ -88,7 +95,7 @@ test_task_pool_lifo_order :: proc(t: ^testing.T) {
 @(test)
 test_task_pool_single_and_reuse :: proc(t: ^testing.T) {
     p: Task_Pool
-    task_pool_init(&p)
+    testing.expect(t, task_pool_init(&p, pool_capacity_for(2)), "init 应成功")
     defer task_pool_destroy(&p)
 
     // 边界：单任务
@@ -114,10 +121,11 @@ test_task_pool_concurrent_pop_each_task_once :: proc(t: ^testing.T) {
     // 既不能丢（漏扫一段字节，结果会少命中），也不能重（同一段被扫两遍，
     // 表现为重叠窗口之外的重复命中）。这是 Task_Pool 唯一的并发不变量。
     p: Task_Pool
-    task_pool_init(&p)
+    testing.expect(t, task_pool_init(&p, pool_capacity_for(POOL_TASKS)), "init 应成功")
     defer task_pool_destroy(&p)
     for i in 0..<POOL_TASKS {
-        task_pool_push(&p, Scan_Task{start = uint(i), end = uint(i) + 1})
+        testing.expect(t, task_pool_push(&p, Scan_Task{start = uint(i), end = uint(i) + 1}),
+            "容量覆盖任务数，push 不应失败")
     }
 
     grid := make([]u8, POOL_WORKERS * POOL_TASKS)

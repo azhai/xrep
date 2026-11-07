@@ -1,3 +1,4 @@
+#+dialect hela
 package lib
 
 // ============================================================================
@@ -6,15 +7,18 @@ package lib
 // 职责：全局常量、跨模块共享的类型定义（匹配上下文 / 匹配结果 / 匹配函数签名 /
 //       算法条目 / 颜色模式 / 汇总统计），以及最基础的字节工具。
 //
-// 依赖：仅依赖 core:mem / core:sync / core:time。本文件是整个工程的**依赖根**，
-//       不引用任何本工程包，被 matcher / worker / scan / cli 等模块共同使用。
+// 依赖：仅依赖 core:mem。本文件是整个工程的**依赖根**，不引用任何本工程包，
+//       被 matcher / worker / scan / cli 等模块共同使用。
 //       数据结构集中放在 lib 包（ADR 0007），这里是其中与匹配/运行期相关的那一半；
 //       选项类数据见 options.odin，容器见 task_pool.odin / output_queue.odin。
+//
+// Hela 方言（ADR 0010）：本文件是方言入口。三个热数据结构是逐字节声明的
+// （`#explicit`：任何未命名字节都是编译错误），`Progress` 的跨线程字段用
+// `#atomic` + `#share` 声明 writer —— 谁写它、占哪一行，由编译器与
+// `-emit-layout` 清单验证，不再靠注释自觉。
 // ============================================================================
 
 import "core:mem"
-import "core:sync"
-import "core:time"
 
 // ---------------------------------------------------------------------------
 // 全局常量与查表
@@ -68,14 +72,25 @@ s2b :: proc(s: string) -> []u8 {
 // 依赖任何人的包里（ADR 0006 曾因它留在 engine 而形成 lib 的前身 common → engine 的环）。
 // 现在两者同在 lib 包（ADR 0007），仍分文件：类型在 base.odin、
 // 操作在 progress.odin —— "数据与操作分离"的常规切法。
+//
+// Hela 无锁化（ADR 0010）：旧版用一把 Mutex 保护 scanned + last_render + 渲染；
+// 现在 scanned 由 worker 用 `atomic_add` 累加（各 worker 写同一行是有意的——
+// 这是真实的共享写，`#share(workers)` 让 --contract 把它显示为一行一个 owner），
+// 渲染权用 `last_render_ns` 的 CAS 抢占（`.share(renderer)`），到达限流间隔的
+// 线程拿权渲染，其余照常累加。total/use_color/enabled 在 init 后只读。
 Progress :: struct {
-    mu:          sync.Mutex,
-    total:       u64, // 总字节数；为 0 时不做任何渲染
-    scanned:     u64, // 已扫描字节数
-    last_render: time.Time, // 上次刷新时刻，用于限流（PROGRESS_MIN_INTERVAL）
-    use_color:   bool, // 是否输出 ANSI 颜色
-    enabled:     bool, // 总开关（--quiet 时关闭）
+    // line 0 — 只有 worker 写（atomic_add），输出线程只读。
+    #align(64) #atomic #share(workers) scanned: u64, // 已扫描字节数
+    // line 1 — 渲染权与上次刷新时刻；CAS 获胜者渲染，天然无撕裂。
+    #align(64) #atomic #share(renderer) last_render_ns: u64, // time.tick_now() 纳秒
+    // init 后只读，与渲染权同行无妨。
+    total:     u64, // 总字节数；为 0 时不做任何渲染
+    use_color: bool,
+    enabled:   bool, // 总开关（--quiet 时关闭）
+    _:         [6]u8, // #explicit：补齐 8 B 对齐，显式命名
 }
+
+#assert(size_of(Progress) == 128)
 
 // 匹配上下文：模式字节、大小写敏感开关，以及**额外模式**（-e / -f 的多模式）。
 // 单模式时 extra 为空 → 走 alg_table 选定的原算法，性能与行为完全不变；
@@ -102,10 +117,17 @@ ctx_pattern_at :: proc(ctx: Match_Ctx, i: int) -> []u8 {
 // 匹配结果：命中位置（文件内的字节偏移）与命中长度。
 // pat_len 由匹配算法写入，用于 --context / -o 的高亮区间；
 // 为 0 表示"未标注"，调用方回退到主模式长度（历史行为，保持兼容）。
-Match_Result :: struct {
+//
+// ADR 0010：这是每命中一个的热数据，16 B 逐字节声明（`#explicit`）——
+// 尾部 4 B 曾经是"没人管的 padding"，现在是有名字的空隙；布局清单
+// （-emit-layout）会导出它的 layout_hash，跨平台字节等价可以被断言。
+Match_Result :: struct #explicit {
     offset:  u64,
     pat_len: u32,
+    _:       [4]u8, // 显式命名的对齐空隙
 }
+
+#assert(size_of(Match_Result) == 16)
 
 // 匹配函数签名（能力缝隙 / capability seam）。
 // 所有算法实现同一签名，便于通过 alg_table 按模式长度互换实现，
@@ -145,7 +167,9 @@ TASK_CHUNK_SIZE :: 2 * mem.Megabyte
 CHUNK_OVERLAP :: 16
 
 // 进度条自动刷新的最小间隔（限流），避免高频刷新拖慢多线程热路径。
-PROGRESS_MIN_INTERVAL :: 200 * time.Millisecond
+// ADR 0010：Progress 无锁化后时间基准换成 `time.tick_now()` 的单调纳秒，
+// 常量也随之从 time.Duration 换成 u64 纳秒（与 last_render_ns 同单位）。
+PROGRESS_MIN_INTERVAL_NS :: u64(200_000_000)
 
 // --threads 的默认值与上限策略：上限 = 逻辑核心数 × MAX_THREADS_FACTOR；
 // 探测不到核心数时退回 FALLBACK_MAX_THREADS。默认值见 cli.parse_args。

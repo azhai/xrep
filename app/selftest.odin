@@ -15,7 +15,6 @@ package app
 // ============================================================================
 
 import "core:fmt"
-import "core:mem"
 import "core:slice"
 import "xrep:engine"
 import "xrep:lib"

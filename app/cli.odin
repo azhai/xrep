@@ -37,7 +37,6 @@ package app
 import "core:fmt"
 import "core:os"
 import "core:strconv"
-import "core:strings"
 import info "core:sys/info"
 import "xrep:lib"
 

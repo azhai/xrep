@@ -1,3 +1,4 @@
+#+dialect hela
 package app
 
 // ============================================================================
@@ -24,9 +25,7 @@ package app
 
 import "base:runtime"
 import "core:fmt"
-import "core:mem"
 import "core:os"
-import "core:sync"
 import "core:thread"
 import "xrep:engine"
 import "xrep:lib"
@@ -204,27 +203,39 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     defer engine.line_index_destroy(&line_index)
 
     // ---- 1) 切分任务：每个任务 TASK_CHUNK_SIZE 字节，最后一块可能不足 ----
+    // ADR 0010：任务池是无锁有界环，容量用分片数向上取 2 的幂 ——
+    // push 因此恒成功（返回值仍 fail-fast，契约显式）。
+    task_count := (file_size + lib.TASK_CHUNK_SIZE - 1) / lib.TASK_CHUNK_SIZE
+    if task_count < 1 {
+        task_count = 1
+    }
     tp: lib.Task_Pool
-    lib.task_pool_init(&tp)
+    if !lib.task_pool_init(&tp, lib.pool_capacity_for(int(task_count))) {
+        return nil
+    }
     defer lib.task_pool_destroy(&tp)
     for pos := uint(0); pos < file_size; {
         end := pos + lib.TASK_CHUNK_SIZE
         if end > file_size {
             end = file_size
         }
-        lib.task_pool_push(&tp, lib.Scan_Task{start = pos, end = end})
+        if !lib.task_pool_push(&tp, lib.Scan_Task{start = pos, end = end}) {
+            return nil
+        }
         pos = end
     }
 
     // ---- 2) 准备共享资源：输出队列 / 命中汇总 ----
     out_q: lib.Output_Queue
-    lib.output_queue_init(&out_q)
+    if !lib.output_queue_init(&out_q) {
+        return nil
+    }
     defer lib.output_queue_destroy(&out_q)
-    match_lists := make([dynamic][]lib.Match_Result)
+    // ADR 0010：每 worker 一个**独占**的 dynamic 数组，worker 只 append 自己的
+    // （一个 worker 可能抢到多个任务）—— list_mu 消失。外层背板由主线程分配。
+    match_lists := make([][dynamic][]lib.Match_Result, thread_count)
     defer delete(match_lists)
-    list_mu: sync.Mutex
     hit_counter: uint = 0
-    hit_mu: sync.Mutex
 
     // ---- 3) 进度条 ----
     // 只在传统输出模式下可见：进度条用 `\r` 原地刷新且写 stdout，
@@ -260,7 +271,6 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
         json = o.json,
         silent = silent,
         out_hits = &hit_counter,
-        hit_mu = &hit_mu,
     }
     out_th := thread.create_and_start_with_data(&out_args, engine.output_thread)
 
@@ -274,8 +284,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
             ctx = o.ctx,
             tp = &tp,
             out_q = &out_q,
-            out_list = &match_lists,
-            list_mu = &list_mu,
+            out_list = &match_lists[i],
             progress = &prog,
             no_stream = no_stream,
         }
@@ -294,7 +303,22 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     lib.progress_finish(&prog)
 
     // ---- 6) 归并分片结果并做区间过滤 ----
-    all_matches := search.merge_ordered_matches(match_lists[:])
+    // 把每 worker 独占数组的内层列表摊平成 merge 的输入（列表内部各自有序，
+    // 与旧共享数组形态相同）；一个 worker 可能贡献多个列表，先数总数。
+    total_lists := 0
+    for i in 0..<int(thread_count) {
+        total_lists += len(match_lists[i])
+    }
+    flat := make([][]lib.Match_Result, total_lists)
+    defer delete(flat)
+    fi := 0
+    for i in 0..<int(thread_count) {
+        for lst in match_lists[i] {
+            flat[fi] = lst
+            fi += 1
+        }
+    }
+    all_matches := search.merge_ordered_matches(flat)
     defer delete(all_matches)
     // 归并只读取内容，不接管所有权；各分片的命中数组必须在这里逐个释放。
     // （此前 worker 会把命中"深拷贝到堆"再挂进 match_lists，而只释放了外层
@@ -302,14 +326,20 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     //  它不可见于 `odin test` 的泄漏统计，因为 worker 用的是归一化后的默认
     //  分配器，而不是测试的追踪分配器。）
     //
-    // 释放必须**显式指定与分配相同的分配器**：这些数组是 worker 线程用
-    // `runtime.default_context().allocator`（进程默认堆）分配的，而本函数运行在
-    // main 线程 —— 在 `odin test` 下 main 的 `context.allocator` 是
-    // mem.Tracking_Allocator，用它去 free 堆指针会直接报 "bad free"。
-    for lst in match_lists {
-        if lst != nil {
-            delete(lst, runtime.default_context().allocator)
+    // 释放必须**显式指定与分配相同的分配器**：内层命中数组由 matcher 在 worker
+    // 线程用 `runtime.default_context().allocator`（进程默认堆）分配；每 worker
+    // 的外层 dynamic 数组同样由 worker 的 append 扩容出来（也在默认堆上）——
+    // 两者都必须用默认分配器 free。本函数运行在 main 线程，`odin test` 下
+    // main 的分配器是 Tracking_Allocator，用它 free 堆指针会报 "bad free"。
+    for i in 0..<int(thread_count) {
+        for lst in match_lists[i] {
+            if lst != nil {
+                delete(lst, runtime.default_context().allocator)
+            }
         }
+        // 外层 dynamic 数组的 backing 带着自己的分配器记录（worker 的默认堆），
+        // delete 直接用它，无需（也不能）再传分配器。
+        delete(match_lists[i])
     }
     filtered := make([dynamic]lib.Match_Result, 0, len(all_matches))
     for res in all_matches {

@@ -1,3 +1,4 @@
+#+dialect hela
 package lib
 
 // ============================================================================
@@ -7,7 +8,9 @@ package lib
 //       done 之后仍有元素时先取完再退出、重复 set_done 幂等。
 //
 // 说明：这些用例刻意"先 push 再 set_done 再 pop"，因此不依赖线程即可确定性
-//       地覆盖退出路径；若先 pop 会阻塞等待 cond（生产端尚未置 done）。
+//       地覆盖退出路径；若先 pop 会自旋等待（生产端尚未置 done，消费者空转）。
+// ADR 0010：Mutex+Cond 换成 core:hela/queue + #atomic done —— done 只能经
+//       sync.atomic_* 访问；init/destroy 显式返回/接收分配器。
 //
 // 线程上下文：自建线程的入口必须先把 context 归一化（见 worker.odin 文件头）。
 //       Odin 创建线程时复制创建者的 context，`odin test` 下那正是测试运行器的
@@ -60,7 +63,7 @@ multi_producer :: proc(data: rawptr) {
 @(test)
 test_output_queue_fifo_after_done :: proc(t: ^testing.T) {
     q: Output_Queue
-    output_queue_init(&q)
+    testing.expect(t, output_queue_init(&q), "init 应成功")
     defer output_queue_destroy(&q)
 
     output_queue_push(&q, Output_Item{offset = 10})
@@ -88,7 +91,7 @@ test_output_queue_fifo_after_done :: proc(t: ^testing.T) {
 @(test)
 test_output_queue_done_without_items :: proc(t: ^testing.T) {
     q: Output_Queue
-    output_queue_init(&q)
+    testing.expect(t, output_queue_init(&q), "init 应成功")
     defer output_queue_destroy(&q)
 
     // 边界：没有任何元素即结束 → 立即返回 false（不阻塞）
@@ -103,13 +106,13 @@ test_output_queue_done_without_items :: proc(t: ^testing.T) {
 @(test)
 test_output_queue_set_done_idempotent :: proc(t: ^testing.T) {
     q: Output_Queue
-    output_queue_init(&q)
+    testing.expect(t, output_queue_init(&q), "init 应成功")
     defer output_queue_destroy(&q)
 
-    testing.expect(t, !q.done, "初始 done 应为 false")
+    testing.expect(t, sync.atomic_load_explicit(&q.done, .Relaxed) == 0, "初始 done 应为 false")
     output_queue_set_done(&q)
     output_queue_set_done(&q) // 重复置位不应出错
-    testing.expect(t, q.done, "done 应为 true")
+    testing.expect(t, sync.atomic_load_explicit(&q.done, .Relaxed) != 0, "done 应为 true")
 
     // 结束后仍可 push（既有语义：set_done 不禁止入队），且能取出
     output_queue_push(&q, Output_Item{offset = 77})
@@ -122,7 +125,7 @@ test_output_queue_set_done_idempotent :: proc(t: ^testing.T) {
 test_output_queue_concurrent_roundtrip :: proc(t: ^testing.T) {
     // 端到端并发验证：1 个生产者 + 1 个消费者，校验总数与顺序完整。
     q: Output_Queue
-    output_queue_init(&q)
+    testing.expect(t, output_queue_init(&q), "init 应成功")
     defer output_queue_destroy(&q)
 
     producer :: proc(data: rawptr) {
@@ -161,7 +164,7 @@ test_output_queue_multi_producer_complete_and_ordered :: proc(t: ^testing.T) {
     //      push 之间不可能插入它自己的后继）→ 命中明细不会自相交错。
     // 注意：跨生产者之间的相对顺序不作要求（那本来就是调度决定的）。
     q: Output_Queue
-    output_queue_init(&q)
+    testing.expect(t, output_queue_init(&q), "init 应成功")
     defer output_queue_destroy(&q)
 
     mu: sync.Mutex

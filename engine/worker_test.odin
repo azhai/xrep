@@ -1,3 +1,4 @@
+#+dialect hela
 package engine
 
 // ============================================================================
@@ -24,30 +25,31 @@ package engine
 // ============================================================================
 
 import "base:runtime"
-import "core:sync"
 import "core:testing"
 import "core:thread"
 import "xrep:lib"
 
+// ADR 0010：worker 的命中汇总改为每 worker 一个固定槽（out_lists[idx]），
+// 输出计数改为本地累加 + 退出写回 —— 测试相应从「动态数组 + 锁」改为固定切片。
+//
 // 喂给输出线程的样例数据（silent 模式下不会被读，仅为让字段非空）
 WORKER_SAMPLE :: "....test...."
 
 // 起一个 worker 线程把给定任务取空，返回它挂进 out_list 的分片列表。
 // 返回值由**调用方**拥有：外层切片用普通 delete，内层用默认分配器 delete。
 run_worker_once :: proc(wd_in: worker_data, tasks: []lib.Scan_Task) -> [][]lib.Match_Result {
+    // 本 worker 独占的 dynamic 数组；一个 worker 可能抢到多个任务，
+    // 每任务一个内层列表（与生产路径 scan_region_parallel 同构）。
     lists: [dynamic][]lib.Match_Result
     tp: lib.Task_Pool
-    lib.task_pool_init(&tp)
+    lib.task_pool_init(&tp, lib.pool_capacity_for(len(tasks)))
     for task in tasks {
-        lib.task_pool_push(&tp, task)
+        _ = lib.task_pool_push(&tp, task)
     }
-    list_mu: sync.Mutex
-
     // 形参不可赋值：复制一份再挂上共享资源（Odin proc 形参是只读的）。
     wd := wd_in
     wd.tp = &tp
     wd.out_list = &lists
-    wd.list_mu = &list_mu
 
     th := thread.create_and_start_with_data(&wd, worker_steal)
     thread.join(th)
@@ -197,7 +199,6 @@ run_output_thread :: proc(items: int, max_count: uint) -> uint {
     defer lib.output_queue_destroy(&q)
 
     hits: uint = 0
-    mu: sync.Mutex
     od := output_data{
         q = &q,
         file_data = lib.s2b(WORKER_SAMPLE),
@@ -205,7 +206,6 @@ run_output_thread :: proc(items: int, max_count: uint) -> uint {
         max_count = max_count,
         silent = true,
         out_hits = &hits,
-        hit_mu = &mu,
     }
 
     th := thread.create_and_start_with_data(&od, output_thread)
