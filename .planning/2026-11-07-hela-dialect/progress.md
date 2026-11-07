@@ -35,3 +35,29 @@ $H check lib -collection:xrep=. -no-entry-point -emit-layout:json \
     -emit-layout-file:/tmp/xrep_lib_layout.json
 /tmp/hela-layout --contract /tmp/xrep_lib_layout.json
 ```
+
+## 追加：M25 数组元素边界（Hela）
+
+- `lib.Match_List`：每 worker 一个命中列表头，整 cache line（`#align(64)` + padding，
+  `#assert(size_of == 64)`）。`match_lists` 从 `[][dynamic][]Match_Result`（40 B 元素，
+  相邻 worker 的头必然同线）改为 `[]lib.Match_List`；`worker_data.out_list` → `^lib.Match_List`。
+- 行为不变：140 单测 + 内建自检 + 78 golden + run2 34 + run3 56 全过。
+- 实测：dense 64 MiB 无可测差异（瓶颈在单线程归并）；微基准证明伪共享本身值 1.4–1.8x。
+
+## 追加：并行归并（ADR 0011）
+
+- `search/merge.odin` 重写：最小堆替代线性扫最小游标（比较键 `(offset, 列表下标)`，
+  精确复刻旧的平局顺序）；新增 `lower_bound` / `upper_bound` / `merge_range` /
+  `merge_split_starts`，全部是纯函数，无线程依赖。
+- `engine/merge.odin` 新增：`merge_ordered_matches_parallel` —— 按全局 rank 切成 p 段，
+  每段一个线程，输出直接写进最终数组的已知区间。主线程备好全部缓冲，线程内零分配。
+  每分区 ≥ 65536 条才起线程（`MERGE_MIN_PER_PART`），分区数上限 16。
+- `app/scan.odin`：接入并行归并；区间过滤从"复制 + 逐条 append"改为
+  "二分上下界 + 原地前移"（无过滤时零成本）；新增 `XREP_PROFILE=1` 阶段计时。
+- 测试：`search` +3（含与旧算法逐条比对的等价性用例），`engine` +2
+  （48 万条 × p=1..8 并行/串行比对、边界情形）。145 单测全过。
+- 实测（64 MiB dense，8.39 M 命中）：端到端 0.35 → 0.06 s（4 线程，5.7x）、
+  0.34 → 0.05 s（10 线程）；merge 281 → 18 ms；filter 21 → 0 ms。
+  1 线程 0.38 → 0.13 s（纯算法 2.9x）。稀疏/中密度无回归。
+- 行为不变：`test.sh` + `verify.sh`（78 golden、run2 34、run3 56、护栏）全过；
+  74 MB dump `cmp` 相同；`--threads 1..16` 的 dump 逐字节相同。

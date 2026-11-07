@@ -27,6 +27,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:thread"
+import "core:time"
 import "xrep:engine"
 import "xrep:lib"
 import "xrep:search"
@@ -184,9 +185,31 @@ print_file_verdict :: proc(label: string, json: bool, matched: bool) {
     fmt.println(label)
 }
 
+// ---------------------------------------------------------------------------
+// 阶段计时开关：`XREP_PROFILE=1` 时把一次扫描的各阶段耗时打到 stderr。
+// 默认关闭（不设环境变量时每个阶段只是一次 bool 判断，不会碰时钟）。
+// ADR 0011 的优化方向就是靠它定的：64 MiB 稠密命中下 82% 的时间在串行归并，
+// 而并行扫描只占 11% —— 没有这个分解，很容易误以为是匹配算法慢。
+// ---------------------------------------------------------------------------
+prof_on: bool
+prof_stamp: time.Tick
+
+prof_mark :: proc(name: string) {
+    if !prof_on {
+        return
+    }
+    now := time.tick_now()
+    fmt.eprintf("[prof] %-10s %8.3f ms\n", name, f64(time.tick_diff(prof_stamp, now)) / 1e6)
+    prof_stamp = now
+}
+
 // 对已读入的整块数据执行并行扫描，返回区间过滤后的命中（按偏移升序）。
 // 调用方负责释放返回切片。
 scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string) -> []lib.Match_Result {
+    pv := os.get_env_alloc("XREP_PROFILE", context.allocator)
+    prof_on = pv != ""
+    delete(pv)
+    prof_stamp = time.tick_now()
     file_size := uint(len(file_data))
     // 防御：没有任何 worker 则任务无人消费，结果会静默变成 0 命中。
     // （main 已用 clamp_thread_count 夹过一次，此处保证直接调用者同样安全。）
@@ -297,6 +320,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
         thread.join(t)
         thread.destroy(t)
     }
+    prof_mark("workers")
     lib.output_queue_set_done(&out_q)
     thread.join(out_th)
     thread.destroy(out_th)
@@ -318,8 +342,11 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
             fi += 1
         }
     }
-    all_matches := search.merge_ordered_matches(flat)
-    defer delete(all_matches)
+    // ADR 0011：归并从"线性扫描 + 单线程"换成"最小堆 + 按 rank 精确切分的并行归并"。
+    // 64 MiB 稠密命中（8.4 M 条 / 32 个分片列表）实测 287 ms → 十几毫秒，
+    // 且输出与旧的串行归并**逐条相同**（切分只依赖数据，不依赖分区数）。
+    merged := engine.merge_ordered_matches_parallel(flat, int(thread_count))
+    prof_mark("merge")
     // 归并只读取内容，不接管所有权；各分片的命中数组必须在这里逐个释放。
     // （此前 worker 会把命中"深拷贝到堆"再挂进 match_lists，而只释放了外层
     //  dynamic 数组 —— 内层切片从未被释放，是一次每分片一次的隐蔽泄漏：
@@ -341,11 +368,26 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
         // delete 直接用它，无需（也不能）再传分配器。
         delete(match_lists[i].list)
     }
-    filtered := make([dynamic]lib.Match_Result, 0, len(all_matches))
-    for res in all_matches {
-        if res.offset >= o.after && res.offset <= o.before {
-            append(&filtered, res)
+    prof_mark("free")
+    // ---- 7) 区间过滤：有序输出上的 --after/--before 是一个**连续区间** ----
+    // 归并结果全局升序，所以"偏移落在 [after, before]"的条目必然连续：
+    // 二分出上下界，把这一段整体前移到分配起点，返回缩短后的切片即可，
+    // 不需要逐条判断 + 重新 append（那是一次全量复制加每条一个分支）。
+    //
+    // 前移而不是直接返回子切片，是因为调用方 `delete(filtered)` 要求指针落在
+    // 分配起点上 —— 与 `--max-count` 的 `filtered = filtered[:n]` 同一个约束。
+    filtered := merged
+    if o.after > 0 || o.before != max(u64) {
+        lo := search.lower_bound(merged, o.after)
+        hi := search.upper_bound(merged, o.before)
+        if lo > 0 {
+            copy(merged[:hi - lo], merged[lo:hi])
         }
+        filtered = merged[:hi - lo]
     }
-    return filtered[:]
+    prof_mark("filter")
+    if prof_on {
+        fmt.eprintf("[prof] merge in: %d lists, %d matches\n", total_lists, len(merged))
+    }
+    return filtered
 }
