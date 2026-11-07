@@ -129,6 +129,27 @@ Match_Result :: struct #explicit {
 
 #assert(size_of(Match_Result) == 16)
 
+// 每 worker 一个命中列表头（ADR 0010 / M25）。
+//
+// 为什么不是裸的 `[dynamic][]Match_Result`：`[dynamic]` 头是 40 字节，而 `make([]T, n)`
+// 会把这些头按 40 字节紧排——元素 i 占 40i..40i+39，所以元素 0 与 1 的尾部/头部落在
+// 同一条 64 B cache line 上。每个 worker append 自己的头（写 len），于是相邻 worker
+// 的 append 每次都在互相 invalidate 对方正在写的行：没有共享字段，却是真伪共享，
+// 而这在 `--contract` 与任何单类型分析里都看不见——它是**数组边界**的性质。
+//
+// 修法是让「含 writer 的类型」正好占满一条 line（编译器 `#+analysis sharing` 会对不满足
+// 的类型报 warning）：`#align(64)` 让每个元素从行边界开始，尾部 padding 让元素不越界。
+// tests/hela/array_share 实测这类布局在 4 线程 append 上有 1.4–1.8x 差距。
+CACHE_LINE :: 64
+
+Match_List :: struct #align(CACHE_LINE) {
+    #share(worker) list: [dynamic][]Match_Result,
+    _:                     [CACHE_LINE - size_of([dynamic][]Match_Result)]u8,
+}
+
+#assert(size_of(Match_List) == CACHE_LINE)
+#assert(align_of(Match_List) == CACHE_LINE)
+
 // 匹配函数签名（能力缝隙 / capability seam）。
 // 所有算法实现同一签名，便于通过 alg_table 按模式长度互换实现，
 // 调用方（worker）无需知道具体算法。

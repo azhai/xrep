@@ -52,7 +52,7 @@ worker_data :: struct {
     ctx:       lib.Match_Ctx,
     tp:        ^lib.Task_Pool, // 共享：任务来源（无锁 MPMC）
     out_q:     ^lib.Output_Queue, // 共享：实时输出队列（无锁 + 反压）
-    out_list:  ^[dynamic][]lib.Match_Result, // 本 worker 独占：只有它 append
+    out_list:  ^lib.Match_List, // 本 worker 独占：只有它 append（整 cache line，见 lib.Match_List）
     progress:  ^lib.Progress,
     no_stream: bool, // 明细不会被打印时跳过输出队列（见下方说明）
 }
@@ -95,7 +95,7 @@ worker_steal :: proc(data: rawptr) {
             }
         }
         // append 进本 worker 独占的数组：与其它 worker 的地址互不重叠，无需任何锁。
-        append(w.out_list, matches)
+        append(&w.out_list.list, matches)
     }
 }
 

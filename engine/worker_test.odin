@@ -40,7 +40,7 @@ WORKER_SAMPLE :: "....test...."
 run_worker_once :: proc(wd_in: worker_data, tasks: []lib.Scan_Task) -> [][]lib.Match_Result {
     // 本 worker 独占的 dynamic 数组；一个 worker 可能抢到多个任务，
     // 每任务一个内层列表（与生产路径 scan_region_parallel 同构）。
-    lists: [dynamic][]lib.Match_Result
+    lists: lib.Match_List
     tp: lib.Task_Pool
     lib.task_pool_init(&tp, lib.pool_capacity_for(len(tasks)))
     for task in tasks {
@@ -55,7 +55,7 @@ run_worker_once :: proc(wd_in: worker_data, tasks: []lib.Scan_Task) -> [][]lib.M
     thread.join(th)
     thread.destroy(th)
     lib.task_pool_destroy(&tp)
-    return lists[:]
+    return lists.list[:]
 }
 
 // 释放分片列表：**内外两层都要用默认分配器**。

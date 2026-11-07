@@ -233,7 +233,7 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     defer lib.output_queue_destroy(&out_q)
     // ADR 0010：每 worker 一个**独占**的 dynamic 数组，worker 只 append 自己的
     // （一个 worker 可能抢到多个任务）—— list_mu 消失。外层背板由主线程分配。
-    match_lists := make([][dynamic][]lib.Match_Result, thread_count)
+    match_lists := make([]lib.Match_List, thread_count)
     defer delete(match_lists)
     hit_counter: uint = 0
 
@@ -307,13 +307,13 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     // 与旧共享数组形态相同）；一个 worker 可能贡献多个列表，先数总数。
     total_lists := 0
     for i in 0..<int(thread_count) {
-        total_lists += len(match_lists[i])
+        total_lists += len(match_lists[i].list)
     }
     flat := make([][]lib.Match_Result, total_lists)
     defer delete(flat)
     fi := 0
     for i in 0..<int(thread_count) {
-        for lst in match_lists[i] {
+        for lst in match_lists[i].list {
             flat[fi] = lst
             fi += 1
         }
@@ -332,14 +332,14 @@ scan_region_parallel :: proc(file_data: []u8, o: lib.Scan_Options, label: string
     // 两者都必须用默认分配器 free。本函数运行在 main 线程，`odin test` 下
     // main 的分配器是 Tracking_Allocator，用它 free 堆指针会报 "bad free"。
     for i in 0..<int(thread_count) {
-        for lst in match_lists[i] {
+        for lst in match_lists[i].list {
             if lst != nil {
                 delete(lst, runtime.default_context().allocator)
             }
         }
         // 外层 dynamic 数组的 backing 带着自己的分配器记录（worker 的默认堆），
         // delete 直接用它，无需（也不能）再传分配器。
-        delete(match_lists[i])
+        delete(match_lists[i].list)
     }
     filtered := make([dynamic]lib.Match_Result, 0, len(all_matches))
     for res in all_matches {
