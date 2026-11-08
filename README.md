@@ -67,14 +67,17 @@ Odin 的原生链接器在本机只能链接**本机平台**和 `darwin_amd64`�
 zig 自带各平台 libc 与 Windows 导入库，因此不需要 sysroot，也不需要真的
 Windows SDK（Makefile 只给一个空目录应付 odin 的 `-windows-sdk-root` 检查）。
 
-### 两个 Windows 特异补丁
+### 三个 Windows 特异补丁
 
-Odin 产出的 COFF 目标文件会引用两个 mingw 未提供的符号，Makefile 已处理，
-改动链接方式时别漏掉：
+Odin 的 COFF 目标文件在 mingw 下需要三处补偿，Makefile 已处理，改动链接方式时别漏掉：
 
 - `BCryptGenRandom` —— Odin runtime 的随机源 → 加 `-lbcrypt`。
 - `_fltused` —— MSVC 的浮点使用标记，mingw 无定义 → Makefile 现编译一个
   空符号垫片 `int _fltused = 0x9875;` 一起链接。
+- `wmain` 入口 —— Odin 发的是 `wmain`（UTF-16 argv），而 zig ≥0.17.1 只按目标文件
+  里有没有 `main` 来选 CRT；只有 `wmain` 时它会选窗口子系统的 `crtexewin`（要求
+  `WinMain`）→ `undefined symbol: WinMain`。`tools/wmain_shim.c` 提供 `main`，
+  用 `CommandLineToArgvW` 重建 UTF-16 argv 再转给 `wmain`（并加 `-lshell32`）。
 
 ### 平台表
 
@@ -97,12 +100,15 @@ Odin 产出的 COFF 目标文件会引用两个 mingw 未提供的符号，Makef
 
 - **`windows_i386` 不提供**：Odin 对 i386 Windows 会关掉 TLS，但生成的
   `__tls_index` 与 mingw 的 `tlssup.obj` 冲突（duplicate symbol）。
+- **`linux-386` 暂不构建**：i386 上 `u64` 原子不是 lock-free，`lib/progress.odin`
+  的 atomic 进度（ADR 0010）在编译期报 `'u64' cannot be used as an atomic ... not lock-free`。
+  已从默认 `make` / `make extra` 移除；`make linux-386` 仍可显式尝试（当前会编译失败）。
 - **wasm 目标不提供**：与本次拆分无关，是 Odin 上游自身的编译错误——
   `wasi_wasm32` 挂在 `core/terminal/internal_os.odin` 的 `_fini_terminal` 未声明，
   `js_wasm32` 挂在 `core:testing` 的 `log.do_level_header` 未声明。等上游修复后再加。
   （拆分前是同一个错误，不是新引入的。）
-- **版本匹配**：已在 odin `dev-2026-10`、zig `0.17.0` 上验证。zig 0.17 起
-  i386 的架构名是 `x86`（旧名 `i386` 会报 unknown architecture）。
+- **版本匹配**：已在 odin `dev-2026-10` / Hela `dev-2026-11`、zig `0.17.0` / `0.17.1`
+  上验证。zig 0.17 起 i386 的架构名是 `x86`（旧名 `i386` 会报 unknown architecture）。
 - **验证深度**：所有产物均通过 `file(1)` 格式核对，darwin 产物实际运行过
   `--version` / `--test`；非本机平台只做到"链接成功 + 格式正确"，未在真机执行。
 

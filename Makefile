@@ -77,11 +77,16 @@ define DEFINE_TARGET
 TARGETS += $(1)
 .PHONY: $(1)
 ifeq ($(7),yes)
-$(1): $(BUILD)/fltused-$(1).o
+$(1): $(BUILD)/fltused-$(1).o $(BUILD)/wmain-$(1).o
 $(BUILD)/fltused-$(1).o:
 	@mkdir -p $(BUILD)
 	@printf 'int _fltused = 0x9875;\n' > $(BUILD)/fltused-$(1).c
 	$(ZIG) cc -target $(3) -c $(BUILD)/fltused-$(1).c -o $$@
+# Odin 在 Windows 发出 `wmain`（UTF-16 argv），而 zig >=0.17.1 只按目标文件里有没有
+# `main` 来选 CRT：只有 wmain 时它选 crtexewin（要 WinMain）→ 链接失败。垫片见该文件。
+$(BUILD)/wmain-$(1).o: tools/wmain_shim.c
+	@mkdir -p $(BUILD)
+	$(ZIG) cc -target $(3) -c tools/wmain_shim.c -o $$@
 endif
 $(1):
 	@mkdir -p $(DIST) $(BUILD) $(WINSDK)
@@ -107,7 +112,7 @@ $(eval $(call DEFINE_TARGET,darwin-arm64,darwin_arm64,,,,native,))
 $(eval $(call DEFINE_TARGET,darwin-amd64,darwin_amd64,,,,native,))
 $(eval $(call DEFINE_TARGET,linux-amd64,linux_amd64,x86_64-linux-gnu,,,cross,))
 $(eval $(call DEFINE_TARGET,linux-arm64,linux_arm64,aarch64-linux-gnu,,,cross,))
-$(eval $(call DEFINE_TARGET,windows-amd64,windows_amd64,x86_64-windows-gnu,.exe,$(BUILD)/fltused-windows-amd64.o -lbcrypt,cross,yes))
+$(eval $(call DEFINE_TARGET,windows-amd64,windows_amd64,x86_64-windows-gnu,.exe,$(BUILD)/fltused-windows-amd64.o $(BUILD)/wmain-windows-amd64.o -lbcrypt -lshell32,cross,yes))
 
 # --- 扩展（Tier 2）---
 $(eval $(call DEFINE_TARGET,linux-386,linux_i386,x86-linux-gnu,,,cross,))
@@ -122,7 +127,9 @@ $(eval $(call DEFINE_TARGET,linux-amd64-musl,linux_amd64,x86_64-linux-musl,,-sta
 $(eval $(call DEFINE_TARGET,linux-arm64-musl,linux_arm64,aarch64-linux-musl,,-static,cross,))
 
 MAIN_TARGETS  := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 windows-amd64
-EXTRA_TARGETS := linux-386 linux-arm linux-riscv64 freebsd-amd64 freebsd-arm64
+# linux-386 暂不进默认集：i386 上 u64 原子不是 lock-free（progress.odin 的
+# scanned / last_render_ns）。显式 `make linux-386` 仍会尝试，但当前会编译失败。
+EXTRA_TARGETS := linux-arm linux-riscv64 freebsd-amd64 freebsd-arm64
 MUSL_TARGETS  := linux-amd64-musl linux-arm64-musl
 
 # ---- 聚合目标 --------------------------------------------------------------
@@ -176,7 +183,7 @@ list:
 		"linux-amd64           linux_amd64        x86_64-linux-gnu" \
 		"linux-arm64           linux_arm64        aarch64-linux-gnu" \
 		"windows-amd64         windows_amd64      x86_64-windows-gnu" \
-		"linux-386             linux_i386         x86-linux-gnu" \
+		"linux-386             linux_i386         x86-linux-gnu（暂不支持：i386 无锁 u64 原子）" \
 		"linux-arm             linux_arm32        arm-linux-gnueabihf" \
 		"linux-riscv64         linux_riscv64      riscv64-linux-gnu" \
 		"freebsd-amd64         freebsd_amd64      x86_64-freebsd-none" \
