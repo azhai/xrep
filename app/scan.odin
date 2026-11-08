@@ -94,6 +94,18 @@ count_in_range :: proc(lists: [][]lib.Match_Result, after, before: u64) -> uint 
 //   dump_ok — 落盘是否成功（未落盘/被跳过视为成功）；false 时错误已写 stderr，
 //             调用方据此把进程退出码置为非 0（见 README）。
 scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bool) {
+    return scan_file_with(path, o, nil)
+}
+
+// scan_file_preloaded 与 scan_file 逐字节同义，只是数据已经由预读线程读好
+// （见 engine/readahead.odin）。缓冲的**所有权仍属于调用方**：本函数不释放 `preloaded`，
+// 因为调用方还要在同一位置把它还回去（分配器也必须对得上 —— 见下面的说明）。
+scan_file_preloaded :: proc(path: string, o: lib.Scan_Options, preloaded: []u8) -> (hits: uint, dump_ok: bool) {
+    return scan_file_with(path, o, preloaded)
+}
+
+@(private)
+scan_file_with :: proc(path: string, o: lib.Scan_Options, preloaded: []u8) -> (hits: uint, dump_ok: bool) {
     dump_ok = true
     // 展示名：多文件 / 递归场景由调用方传入（可能是 walk 展开后的相对路径）。
     label := o.path_label
@@ -115,12 +127,23 @@ scan_file :: proc(path: string, o: lib.Scan_Options) -> (hits: uint, dump_ok: bo
         }
     }
 
-    file_data, err := engine.read_file_data(path)
-    if err != nil {
-        fmt.fprintf(os.stderr, "open %s failed: %v\n", path, err)
-        return 0, true
+    // 数据要么已经由预读线程读好（`preloaded`），要么现在读。两条路径产生的
+    // `file_data` 完全等价，区别只在谁付了这次读盘的时间。
+    file_data := preloaded
+    owned := false
+    if file_data == nil {
+        data, err := engine.read_file_data(path)
+        if err != nil {
+            fmt.fprintf(os.stderr, "open %s failed: %v\n", path, err)
+            return 0, true
+        }
+        file_data = data
+        owned = true
     }
-    defer delete(file_data)
+    // 只释放自己读的那一份；预读的那份由调用方（main）释放。
+    defer if owned {
+        delete(file_data)
+    }
     file_size := uint(len(file_data))
 
     // ---- 命中结果：空文件直接为空，避免为一无所有的文件建池起线程 ----

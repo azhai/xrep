@@ -197,16 +197,21 @@ bndm_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> [
         return results[:]
     }
 
-    // 预处理：B[c] 的第 j 位为 1 ⟺ pat[j] == c（大小写不敏感时双方都取小写）。
+    // 预处理：B[c] 的第 j 位为 1 ⟺ pat[j] == c。
+    //
+    // 大小写不敏感时，**两种写法都在建表时置位**，而不是在扫描循环里查表折叠。
+    // 差别是每字节一次还是每模式一次：表格只有 256 项，多置一份是免费的；而扫描
+    // 循环里那行 `c = lower_table[c]` 对 256 MiB 的语料是 256M 次额外加载，
+    // 实测让 `-i` 的 m>=3 路径从 46 ms 涨到 80 ms（这段开销与命中率无关，
+    // 纯属每字节都要付）。改成扫描时直接用原始字节索引 B，那个 34 ms 就没了。
     B: [256]u64
-    if ctx.case_insensitive {
-        for j := uint(0); j < m; j += 1 {
-            B[lib.lower_table[pat[j]]] |= 1 << j
+    for j := uint(0); j < m; j += 1 {
+        b := pat[j]
+        if ctx.case_insensitive {
+            b = lib.lower_table[b]
+            B[alt_case(b)] |= 1 << j // 'a'..'z' -> 'A'..'Z'，非字母原样
         }
-    } else {
-        for j := uint(0); j < m; j += 1 {
-            B[pat[j]] |= 1 << j
-        }
+        B[b] |= 1 << j
     }
     // 低 m 位全 1。m == 64 时 `1 << 64` 是未定义行为，必须单独处理。
     full: u64 = ~u64(0)
@@ -221,11 +226,8 @@ bndm_match :: proc(data: []u8, ctx: lib.Match_Ctx, progress: ^lib.Progress) -> [
         last := m
         D := full
         for {
-            c := data[pos + j]
-            if ctx.case_insensitive {
-                c = lib.lower_table[c]
-            }
-            D &= B[c]
+            // 原始字节直接查表：两种大小写在建表时都已置位，这里不需要折叠。
+            D &= B[data[pos + j]]
             if D == 0 {
                 break
             }

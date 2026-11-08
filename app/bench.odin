@@ -253,6 +253,52 @@ run_bench :: proc() {
         bench_case(label, search.multi_ac_match, sparse, ctx, &p)
     }
 
+    // ---- A6. 单字节预筛：命中密度 × 大小写敏感 ----
+    // 为什么专门加这一组：`-i` 的代价曾经**只**在"命中密集但不满屏"的分布上暴露。
+    // 稀疏数据（A1/A5）走 64 字节块，每块扫完就跳过，看不出差别；全命中数据
+    // （A4 的 dense/zeros）退化成逐字节比较，两种实现同样慢。真正难受的是
+    // "平均每几十字节一次命中"——每 64 字节块都命中，于是块内定位路径每次都被走到。
+    // 第三版把块内定位从"标量重扫"改为 `select + reduce_min` 之前，这里的
+    // `1/36 -i` 比 `1/36 sens` 慢 61%（46.0 → 70.1 ms，256 MiB 端到端）。
+    //
+    // 数据用 `onebig.bin` 的实际构造（"alpha beta gamma delta epsilon zeta\n" 恰好
+    // 36 字节、含一个小写 z），密度 1/36 不是编出来的数字。
+    fmt.println("\n-- A6. single-byte prefilter: hit density × case sensitivity, 16 MiB each --")
+    a6 := mem.Megabyte * 16
+    a6_line := lib.s2b("alpha beta gamma delta epsilon zeta\n") // 36 B，含一个 'z'
+    a6_dense_ish := make([]u8, a6)
+    defer delete(a6_dense_ish)
+    for off := 0; off + len(a6_line) <= len(a6_dense_ish); off += len(a6_line) {
+        copy(a6_dense_ish[off:off + len(a6_line)], a6_line)
+    }
+    a6_sparse := make([]u8, a6)
+    defer delete(a6_sparse)
+    for i in 0..<len(a6_sparse) {
+        a6_sparse[i] = '.'
+    }
+    for off := 0; off < len(a6_sparse); off += 4096 {
+        a6_sparse[off] = 'z'
+    }
+    a6_saturated := make([]u8, a6)
+    defer delete(a6_saturated)
+    for i in 0..<len(a6_saturated) {
+        a6_saturated[i] = 'z'
+    }
+    // 8 行显式调用而不是表格驱动：`(struct{...}){...}` 这种"匿名结构体切片字面量"
+    // 在本版 Odin 里要写成一个具名局部类型才过得去，多出的类型声明比多写 6 行调用更难读。
+    a6_case :: proc(label, pat: string, data: []u8, ci: bool, p: ^lib.Progress) {
+        ctx := lib.Match_Ctx{pattern = lib.s2b(pat), case_insensitive = ci}
+        bench_case(label, search.single_match, data, ctx, p)
+    }
+    a6_case("1/36 sens", "z", a6_dense_ish, false, &p)
+    a6_case("1/36 -i", "z", a6_dense_ish, true, &p)
+    a6_case("1/4K sens", "z", a6_sparse, false, &p)
+    a6_case("1/4K -i", "z", a6_sparse, true, &p)
+    a6_case("1/1 sens", "z", a6_saturated, false, &p)
+    a6_case("1/1 -i", "z", a6_saturated, true, &p)
+    a6_case("1/36 word", "gamma", a6_dense_ish, false, &p)
+    a6_case("1/36 word -i", "gamma", a6_dense_ish, true, &p)
+
     fmt.printf("\n-- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / %d B) --\n", BENCH_SPARSE_HIT_BYTES)
     bench_scan_scaling(sparse, lib.Match_Ctx{pattern = lib.s2b("test")}, "bench")
 

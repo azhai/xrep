@@ -251,16 +251,17 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `lib/progress.odin` | 进度条操作（`\r` 原地刷新 + 限流，`--quiet` 或非传统输出模式时整体关闭）；类型定义在 `base.odin` |
 | `app/cli.odin` | `parse_args`（纯解析，不含退出策略；`file_list` **按需分配、调用方负责 `options_destroy`**）、`normalize_args`（`--k=v`、`-t8`、`-rn` 归一化）、短标志别名、`read_pattern_file`、`max_threads_for_machine`、`print_help`/`print_version` |
 | `search/matcher.odin` | `single_match`（SIMD 跳跃 + 密集段就地消费）/ `memchr_match`（首字节 SIMD 预筛 + 倒序验证，**候选密度超 1/4 时把剩余区间交给 `bndm_match`**）/ `naive_match`（兜底）/ `bndm_match`（**真正的位并行 BNDM**，u64 位掩码 + 反向窗口）/ `multi_match`（多模式，首字节 256 位图预筛），以及**编译期常量**的算法选择表 `alg_table` + `select_matcher` + `select_matcher_for`（≥16 个模式改走 `multi_ac_match`）。命中数组用 `context.allocator` 分配、**所有权归调用方**（ADR 0004；分层见 ADR 0008/0009） |
-| `search/scan.odin` | `index_either`：**双候选单趟**的 SIMD 首字节预筛（每轮 64 B / 4 个 `u8x16`）。`find_byte` 的单候选仍走 `core:bytes.index_byte`，双候选（大小写不敏感）走这里 —— 旧写法 `min(index_byte(a), index_byte(b))` 是两趟完整扫描，稀疏命中时流量翻倍，密集命中时退化成 O(n²)（ADR 0012） |
+| `search/scan.odin` | `index_either` / `index_folded`：**双候选单趟**的 SIMD 首字节预筛。`find_byte` 的单候选仍走 `core:bytes.index_byte`，双候选（大小写不敏感）走这里 —— 旧写法 `min(index_byte(a), index_byte(b))` 是两趟完整扫描，稀疏命中时流量翻倍，密集命中时退化成 O(n²)（ADR 0012）。块内定位走 `select + reduce_min`（与 `core:bytes` 同一套手法），**不做标量重扫** —— 后者在"平均每几十字节一次命中"的分布上每次调用多走十几条标量分支，实测让 `-i` 慢 3.5x（ADR 0013） |
 | `search/ac.odin` | Aho-Corasick 多模式自动机：`AC`（**字母表压缩到 σ+1 列**的完全转移表 + fail + 输出链接）、`ac_build`/`ac_destroy`、`multi_ac_match`（**延迟线保证输出与 `multi_match` 逐条一致**）、`ac_worth_it` 阈值判据（ADR 0009） |
 | `app/walk.odin` | 目录遍历与 glob：`glob_match`/`walk_dir`/`walk_expand`/`walk_free`（递归、隐藏文件、glob、exclude 的选项类型是 `lib.Walk_Options`） |
 | `search/merge.odin` | `merge_ordered_matches`：多分片命中列表的多路有序归并（游标临时缓冲用后即释放） |
 | `search/slice_utils.odin` | 泛型切片工具：map / fold / filter / take / drop / sort |
 | `engine/worker.odin` | `worker_steal`（扫描线程）与 `output_thread`（唯一打印线程，含 JSON/行导向/`-o`/`-m` 分支）；**线程入口先归一化 `context`**；打印与 dump 均**攒批写出**（64 KiB 阈值）；silent 模式（`-q/-c/-l/-L` 且无 `-m`）跳过实时输出队列（ADR 0008） |
 | `engine/io_utils.odin` | `read_file_data`、`file_size_of`（--max-size 探测）、`context_range`、`print_context`、`sanitize_dump_name`、`dump_matches`（覆盖/追加、**攒批**）、**`build_line_index`（`Line_Index`，自适应抽稀的稀疏换行表）/`line_of`（二分 + 块内回扫 + `Line_Hint` 快路径）、`json_escape`、`print_hex_bytes`、`resolve_color`** |
-| `app/scan.odin` | `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**）；选项类型 `lib.Scan_Options` 见 `lib/options.odin` |
+| `app/scan.odin` | `scan_file` 单文件编排（`--max-size` 拦截 → 空文件快速跳过 → 并行扫描 → 过滤 → `-l/-L`/`--count`/`--json`/统计 → 落盘）与 `scan_region_parallel`（**归并后释放各分片命中数组**）；选项类型 `lib.Scan_Options` 见 `lib/options.odin`。`scan_file_preloaded` 接受调用方已读好的数据（预读管线用），所有权仍在调用方 |
+| `engine/readahead.odin` | **预读管线**：一个读者线程 + `sync.Cond` 有界队列（深度 2），按 `files` 原始顺序入队/出队，于是"读下一个文件"与"扫当前文件"重叠而输出顺序不变。`Read_Item.skipped` 是独立一位（"读到 0 字节"与"没读"是两件事）；单个大文件走 `read_file_parallel` 分块 `pread`（每段带**文件绝对偏移**）。`XREP_NO_READAHEAD=1` 回到串行读（ADR 0013） |
 | `app/selftest.odin` | 内建自检 `run_tests`（`--test`），随二进制分发 |
-| `app/bench.odin` | 微基准 `run_bench`（`--bench`）：A1~A3 算法吞吐（含 `multi_match` vs `multi_ac` 的衰减曲线）、A4 两种单模式算法对拍、A5 多模式纯扫描成本、B 组端到端线程伸缩 |
+| `app/bench.odin` | 微基准 `run_bench`（`--bench`）：A1~A3 算法吞吐（含 `multi_match` vs `multi_ac` 的衰减曲线）、A4 两种单模式算法对拍、A5 多模式纯扫描成本、A6 单字节预筛的「命中密度 × 大小写」矩阵、B 组端到端线程伸缩 |
 
 > `arena_pool.odin` 已在 ADR 0004 中删除（arena 定长，无法承载无界的命中结果集）。
 
@@ -272,7 +273,7 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `tools/guard.sh` | 静态护栏：工具自检 → 字面量污染检测 → `make deps`。`verify.sh` 的第 0 层，也可 `make guard` 单独跑 |
 | `tools/literal_allowlist.txt` | 字面量检测的白名单（当前为空；只有**有意**在文本里写 `包名.符号名` 才需要加行） |
 
-### 测试代码（13 个文件，140 个用例）
+### 测试代码（16 个文件，153 个用例）
 
 | 测试文件 | 覆盖目标 | 用例数 |
 | --- | --- | --- |
@@ -285,13 +286,16 @@ main.odin              package main    入口编排（根目录唯一的生产�
 | `lib/progress_test.odin` | 初始化字段、禁用时不累加 `scanned`、启用时累加与限流、`total=0` 渲染短路 | 5 |
 | `search/slice_utils_test.odin` | map/fold/filter/take/drop/sort 的空切片、n=0、n=len、n>len、重复键等边界 | 5 |
 | `lib/base_test.odin` | `lower_table` 填充规则（含非字母透传）、`s2b` 零拷贝、`clamp_thread_count` 边界、常量不变量、**`ctx_pattern_count`/`ctx_pattern_at` 模式表访问器** | 5 |
-| `search/merge_test.odin` | 空列表集合、单列表、三路交错、空条目、重复偏移、总长度不变量、**8 路随机分片的多重集与升序校验**、**全同偏移的极限形态** | 6 |
+| `search/merge_test.odin` | 空列表集合、单列表、三路交错、空条目、重复偏移、总长度不变量、**8 路随机分片的多重集与升序校验**、**全同偏移的极限形态** | 9 |
+| `engine/merge_test.odin` | 并行归并的**输出等价**（8 列表 × 6 万条，p=4 与串行逐条相同，ADR 0011）、空输入/全空列表返回 `nil` 且不分配 | 2 |
+| `engine/readahead_test.odin` | 预读按序交付（0/1/17/4096/3 字节文件，验首末字节来源）、`--max-size` 下全部 `skipped` 且仍按序、只取一条就 `destroy` 不泄漏、`read_file_parallel` 在 1/2/4 读者下与整块读逐字节相同、文件缺失报错 | 5 |
+| `search/scan_test.odin` | `index_either` / `index_folded` 与朴素实现逐位置对拍（块边界、块内位置、尾部不足一块）、**长度 0..199 × 每位置单独命中的穷举** —— `select + reduce_min` 的道号偏移错一位与末段越界最容易在抽样里被避开、同长度下完全无命中、两候选相同时转接 `core:bytes` | 3 |
 | `lib/output_queue_test.odin` | FIFO、`done` 后立即返回、重复 `set_done`、单生产者/单消费者并发往返、**4 生产者 × 250 条的总数与每生产者 FIFO 校验** | 5 |
 | `lib/task_pool_test.odin` | 空池出队、LIFO 顺序、取空后可复用、**4 线程抢 200 任务：每个任务恰好被弹出一次** | 4 |
 | `engine/worker_test.odin` | **命中偏移从分片相对改写为文件绝对**（`--after/--before`/`--dump`/行号都依赖它）、多任务产出多分片列表、空任务池立即退出、多模式分派确实走 `multi_match`、**输出线程的 `-m` 计数契约与 done 退出** | 4 |
 
-> 用例数合计 140；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
-> 逐包分布：lib 19、search 34、engine 26、app 61（`odin test` 一次只跑一个包，
+> 用例数合计 153；`arena_pool_test.odin` 已随 ADR 0004 删除（6 个用例）。
+> 逐包分布：lib 19、search 40、engine 33、app 61（`odin test` 一次只跑一个包，
 > 见上节）。新增子目录包时，记得把路径加进 `test.sh` 的 `PACKAGES`。
 
 ### 关于"没有输出文本断言"
@@ -335,13 +339,24 @@ ODIN_CC=/usr/bin/clang odin test ./app -collection:xrep=. -linker:lld \
 
 ```bash
 ./xrep --test             # 进程内自检（slice 工具 + 匹配 + 归并 + glob + JSON 转义 + 清洗）
-./xrep --bench            # 微基准（耗时约 7s，见下节）
+./xrep --bench            # 微基准（耗时约 40s，见下节）
 tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update / TESTS_FILTER）
 ```
 
-### 微基准（`--bench`，约 7s）
+### 环境变量（只有一个）
 
-五组测量，全部在内存里的合成数据上跑，不落盘：
+```bash
+XREP_NO_READAHEAD=1 ./xrep pat -r dir    # 关掉预读，回到一次读一个文件的串行路径
+```
+
+预读默认**开**，所以这条开关只做"关"：一个有副作用的环境开关比一个纯开关更难推理。
+它的用途是 A/B 测量与排障 —— 怀疑"输出顺序不对"或"内存占用异常"时，先关掉它，
+就能把预读排除在因之外（顺序本来就是队列契约，关掉之后逐字节输出必须完全相同）。
+
+### 微基准（`--bench`，约 40s）
+
+六组测量，全部在内存里的合成数据上跑，不落盘。**耗时几乎全在 A3**：64 个模式那一档
+只有 38 MB/s，100 MiB × 5 轮就是十几秒；新加的 A6 跑满 8 个 case 也只要一秒出头。
 
 - **A1/A2 · 单模式吞吐**（100 MiB 周期数据，每档 5 轮取**最快一轮**）：
   按模式长度分档 1B / 2B / 4B / 16B / 17B / 64B / 128B —— 覆盖 `alg_table`
@@ -354,6 +369,11 @@ tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update /
   谁只做退化出口"。
 - **A5 · 多模式纯扫描成本**：稀疏数据（几乎无命中）上跑两种多模式实现，
   把"扫描"从"命中发射"里剥出来 —— 否则稠密数据测的是结果数组的追加成本。
+- **A6 · 单字节预筛：命中密度 × 大小写**（16 MiB，三种密度 × 两种候选数）：这一组存在的
+  唯一理由是把 `-i` 的代价钉在**分布**上。1/4K 与 1/1 都看不出问题（前者块内一次都不命中
+  就不重扫，后者退化成逐字节比较、两种实现同样慢），只有 **1/36** 这种"平均每几十字节一次
+  命中"的中间区间会稳定走到块内定位路径 —— 而真实文本几乎都是这种分布。数据用
+  `"alpha beta gamma delta epsilon zeta\n"`（恰好 36 字节、含一个小写 `z`）铺成，密度不是编的。
 - **B 组 · 端到端线程伸缩**（64 MiB 稀疏数据，每档 3 轮取最快一轮）：
   直接跑 `scan_region_parallel` —— 任务池 + worker + 输出队列 + 归并的完整路径。
 
@@ -373,6 +393,11 @@ tests/run.sh ./xrep       # 只跑历史命令 golden 矩阵（可加 --update /
   uniform  memchr_match   34115.14 MB/s     uniform  bndm_match   7670.18 MB/s
   dense    memchr_match      87.13 MB/s     dense    bndm_match    163.74 MB/s
   zeros    memchr_match     813.67 MB/s     zeros    bndm_match    836.12 MB/s
+-- A6. single-byte prefilter: hit density × case sensitivity, 16 MiB each --
+  1/36 sens single_match    5289.30 MB/s     1/36 -i  single_match    5074.50 MB/s
+  1/4K sens single_match   58181.80 MB/s     1/4K -i  single_match   47761.20 MB/s
+  1/1  sens single_match     197.70 MB/s     1/1  -i  single_match     212.40 MB/s
+  1/36 word single_match    4955.10 MB/s     1/36 word -i  single_match  5138.10 MB/s
 -- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / 65536 B) --
   1 thread(s)        57813.91 MB/s   1.00x
   8 thread(s)        88154.27 MB/s   1.52x
@@ -601,6 +626,29 @@ dump、`--test`/`--help`）各采集 stdout、stderr、退出码三份产物，
   ③ 行号表改为**自适应抽稀的稀疏索引 + `Line_Hint` 查询提示**，
   300 万行文本上索引 24 MB → 2 MB，`-n` 1.04 s → 0.91 s。
   **对外行为零变化**：140 用例全绿，golden 与 dump 逐字节一致。
+- `ADR 0010`（`.ai-memory/adr/0010-hela-dialect-concurrency.md`）：
+  用 Hela 方言（`/opt/repos/hela` 的 Odin fork）重写并发骨架，**零改动即可编译**。
+  `Mutex + LIFO` / `Mutex + Cond` 手写环换成 `hela/queue` 无锁 MPMC（有界 + 反压）；
+  `Progress` 无锁化（`atomic_add` + 渲染权 CAS）；`list_mu`/`hit_mu` 全删，
+  改为**每 worker 独占动态数组**（固定槽会因一个 worker 抢到多个任务而互相覆盖、丢命中）。
+  稠密流式 3.26 s → 1.66 s（1.97x），TSAN 全绿，`--contract` 报 0 conflicts。
+- `ADR 0011`（`.ai-memory/adr/0011-parallel-merge.md`）：**并行归并**。最小堆（键
+  `(offset, 列表下标)`，复刻串行平局顺序）+ 按全局 rank **精确切分**（二分边界值 v，再按
+  列表下标补足"等于 v"的条目），于是输出与串行逐条相同、且**与分区数无关**。
+  dense 0.35 → 0.06 s（5.7x）；1 线程 0.38 → 0.13 s（纯算法 2.9x）。
+- `ADR 0012`（`.ai-memory/adr/0012-count-only-and-single-pass-prescan.md`）：
+  ① **只要计数就不归并** —— `needs_items` 判定后，`count_in_range` 在每片有序列表上二分求和，
+  与命中总数无关；`scan_region_parallel` 的返回契约变为 `(filtered, count)`。
+  ② **双候选单趟预筛** —— `index_either`，一趟里同时比两个候选。
+  旧写法 `min(index_byte(a), index_byte(b))` 是两趟，稀疏数据流量翻倍、密集数据退化成 O(n²)。
+- `ADR 0013`（`.ai-memory/adr/0013-read-ahead-and-vector-locate.md`）：
+  ① **预读管线** —— 一个读者线程 + `sync.Cond` 有界队列（深度 2），"读下一个文件"与
+  "扫当前文件"重叠而输出顺序不变（32 × 4.5 MiB 冷读 1.17x、暖 1.31x）；
+  ② **块内定位改向量归约** —— `select + reduce_min` 取代逐字节重扫。后者在"平均每几十字节
+  一次命中"的真实文本分布上让 `-i` 慢 3.5x；改完之后 `-i` 与 `-c` 回到同一条线
+  （256 MiB 端到端 76.78 → 43.73 ms，1.76x）。另有三条**诚实负面结论**：BNDM 建表双向置位
+  无收益、`match_rest` 不在热路径（所以"两候选单趟"对它没意义）、单文件暖数据的并行 `pread`
+  无收益。
 
 
 

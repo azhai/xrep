@@ -15,12 +15,21 @@ package main
 //   1 — 参数错误，或任一 dump 落盘失败（--dump / --dump-prefix 写不进去）
 // ============================================================================
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:time"
 import "xrep:app"
 import "xrep:engine"
 import "xrep:lib"
+
+// 预读默认开启（多文件时）。环境变量只做"关"，因为"开"已经是默认值：
+// 一个有副作用的环境开关比一个纯开关更难推理。
+readahead_disabled :: proc() -> bool {
+    v := os.get_env_alloc("XREP_NO_READAHEAD", context.allocator)
+    defer delete(v)
+    return v != ""
+}
 
 main :: proc() {
     // 全局表（lower_table / alg_table）**不在这里初始化**：
@@ -113,13 +122,52 @@ main :: proc() {
     started := time.now()
 
     // 多文件顺序处理（单文件内部并行）。
+    //
+    // 从 ADR 0013 起，"读下一个文件"与"扫当前文件"重叠：读者线程按同一顺序预读，
+    // 主线程从队列取（见 engine/readahead.odin）。顺序不变，因此输出不变；
+    // 单文件时没有"下一个"可重叠，预读是纯开销，所以不启用。
+    // `XREP_NO_READAHEAD=1` 关掉它 —— A/B 测量与排障都需要一条回到串行读的路。
     total_hits: uint = 0
     io_failed := false
-    for f in files {
-        hits, dump_ok := app.scan_file(f, scan_opts)
-        total_hits += hits
-        if !dump_ok {
-            io_failed = true
+    reader: engine.Reader
+    use_reader := !readahead_disabled() && n_files > 0
+    if use_reader && n_files == 1 {
+        // 单文件没有"下一个"可重叠，但**大文件仍值得并行读**：一个同步 read 是队列
+        // 深度 1（1.81 GB/s），两个 pread 是 3.15 GB/s。小于阈值的单文件不为它起线程。
+        size, size_ok := engine.file_size_of(files[0])
+        use_reader = size_ok && size >= engine.PARALLEL_READ_MIN
+    }
+    if use_reader && engine.readahead_init(&reader, files[:], scan_opts.max_size) {
+        for {
+            item, ok := engine.readahead_next(&reader)
+            if !ok {
+                break
+            }
+            hits: uint
+            dump_ok: bool
+            if !item.skipped {
+                hits, dump_ok = app.scan_file_preloaded(item.path, scan_opts, item.data)
+                // 预读的缓冲由读者线程用进程默认堆分配：这里必须用同一个分配器还回去
+                // （`odin test` 下主线程的 context.allocator 是追踪分配器）。
+                delete(item.data, runtime.default_context().allocator)
+            } else {
+                // 太大、读失败、或会被 --max-size 跳过：走原路径，措辞与退出码不变。
+                hits, dump_ok = app.scan_file(item.path, scan_opts)
+            }
+            total_hits += hits
+            if !dump_ok {
+                io_failed = true
+            }
+        }
+        // 必须在 walk_free 之前停掉读者线程：它借用的是 `files` 里的字符串。
+        engine.readahead_destroy(&reader)
+    } else {
+        for f in files {
+            hits, dump_ok := app.scan_file(f, scan_opts)
+            total_hits += hits
+            if !dump_ok {
+                io_failed = true
+            }
         }
     }
 

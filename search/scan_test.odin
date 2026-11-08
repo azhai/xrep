@@ -82,3 +82,62 @@ test_index_either_matches_naive :: proc(t: ^testing.T) {
     // 5) 空切片：不能越界
     testing.expect_value(t, index_either([]u8{}, 'a', 'A'), -1)
 }
+
+// 穷举「长度 × 命中位置」：长度 0..199 覆盖了 16 字节块的不足一段、整段、
+// 多段，以及 64 字节块的三种边界；位置上每一处单独命中一次。
+//
+// 为什么必须穷举而不是抽样：第三版把块内定位从"逐字节重扫"换成了
+// `select + reduce_min`。这个改动最危险的失败模式是**道号偏移算错一位**
+// 或**在最后一段不足 16 字节时返回越界下标** —— 抽样很容易刚好避开。
+@(test)
+test_index_exhaustive_lengths_and_positions :: proc(t: ^testing.T) {
+    buf := make([]u8, 200)
+    defer delete(buf)
+
+    for n in 0 ..< 200 {
+        for at in 0 ..< n {
+            // 整段重置（200 字节 × 2 万轮，代价可以忽略；不做"只擦上一个位置"
+            // 的微优化，免得测试本身也埋一个下标错误）。
+            for i in 0 ..< n {
+                buf[i] = '.'
+            }
+            // 交替放置 a / b 与大写形式：三个分支（折叠路径 / 双向量路径 /
+            // 两候选相同）都要被"命中在最前"覆盖到。
+            if at % 3 == 0 {
+                buf[at] = 'a'
+            } else if at % 3 == 1 {
+                buf[at] = 'A'
+            } else {
+                buf[at] = 'a'
+            }
+            got := index_either(buf[:n], 'a', 'A')
+            if got != at {
+                fmt.eprintfln("n=%d at=%d: index_either got %d", n, at, got)
+            }
+            testing.expect_value(t, got, at)
+
+            got_folded := index_folded(buf[:n], 'a')
+            if got_folded != at {
+                fmt.eprintfln("n=%d at=%d: index_folded got %d", n, at, got_folded)
+            }
+            testing.expect_value(t, got_folded, at)
+        }
+
+        // 同一份长度下"完全没有命中"：确认循环在每一段都不会误报。
+        for i in 0 ..< n {
+            buf[i] = '.'
+        }
+        testing.expect_value(t, index_either(buf[:n], 'a', 'A'), -1)
+        testing.expect_value(t, index_folded(buf[:n], 'a'), -1)
+    }
+}
+
+// 非字母的折叠路径：`alt_case` 对非字母返回自身，于是 `a == b` 直接落到
+// core 的 `index_byte`；这里只确认那条转接是通的（core 的实现由 core 自己测）。
+@(test)
+test_index_either_same_candidate_delegates :: proc(t: ^testing.T) {
+    buf := []u8{'.', '.', '.', '\n', '.', '.', '\n'}
+    testing.expect_value(t, index_either(buf, '\n', '\n'), 3)
+    testing.expect_value(t, index_either(buf, '\r', '\r'), -1)
+}
+
