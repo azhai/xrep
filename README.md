@@ -394,10 +394,10 @@ XREP_NO_READAHEAD=1 ./xrep pat -r dir    # 关掉预读，回到一次读一个�
   dense    memchr_match      87.13 MB/s     dense    bndm_match    163.74 MB/s
   zeros    memchr_match     813.67 MB/s     zeros    bndm_match    836.12 MB/s
 -- A6. single-byte prefilter: hit density × case sensitivity, 16 MiB each --
-  1/36 sens single_match    5289.30 MB/s     1/36 -i  single_match    5074.50 MB/s
-  1/4K sens single_match   58181.80 MB/s     1/4K -i  single_match   47761.20 MB/s
-  1/1  sens single_match     197.70 MB/s     1/1  -i  single_match     212.40 MB/s
-  1/36 word single_match    4955.10 MB/s     1/36 word -i  single_match  5138.10 MB/s
+  1/36 sens single_match    4990.60 MB/s     1/36 -i  single_match    4961.20 MB/s
+  1/4K sens single_match   58394.20 MB/s     1/4K -i  single_match   47619.10 MB/s
+  1/1  sens single_match     193.80 MB/s     1/1  -i  single_match     204.50 MB/s
+  1/36 word memchr_match    4429.70 MB/s     1/36 word -i memchr_match 4437.10 MB/s
 -- B. end-to-end scan_region_parallel (pattern 'test', 1 hit / 65536 B) --
   1 thread(s)        57813.91 MB/s   1.00x
   8 thread(s)        88154.27 MB/s   1.52x

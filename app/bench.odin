@@ -286,9 +286,17 @@ run_bench :: proc() {
     }
     // 8 行显式调用而不是表格驱动：`(struct{...}){...}` 这种"匿名结构体切片字面量"
     // 在本版 Odin 里要写成一个具名局部类型才过得去，多出的类型声明比多写 6 行调用更难读。
+    //
+    // 算法必须按模式长度**显式选**，不能一律 `single_match`：`single_match` 只看
+    // `ctx.pattern[0]`（它按定义就是单字节算法），拿它跑 `"gamma"` 会得到"每个 `g` 都算一次
+    // 命中"——而这一份数据每行恰好各有一个 `g` 和一个 `z`，于是命中数与 `"z"` 完全相同，
+    // 表里看不出来任何异常。第一版就是这样，那一行测的其实是单字节 `'g'`。
+    // 单字节走 `single_match`，多字节走 `memchr_match`（`select_matcher_for` 在这两种
+    // 长度上选的就是它们）。
     a6_case :: proc(label, pat: string, data: []u8, ci: bool, p: ^lib.Progress) {
         ctx := lib.Match_Ctx{pattern = lib.s2b(pat), case_insensitive = ci}
-        bench_case(label, search.single_match, data, ctx, p)
+        m := len(pat) == 1 ? search.single_match : search.memchr_match
+        bench_case(label, m, data, ctx, p)
     }
     a6_case("1/36 sens", "z", a6_dense_ish, false, &p)
     a6_case("1/36 -i", "z", a6_dense_ish, true, &p)
